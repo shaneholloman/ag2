@@ -23,11 +23,11 @@ llm_config = {
 }
 ```
 
-````mdx-code-block
-:::warning
-It is important to never commit secrets into your code, therefore we read the OpenAI API key from an environment variable.
-:::
-````
+<div class="warning">
+        <Warning>
+        It is important to never commit secrets into your code, therefore we read the OpenAI API key from an environment variable.
+        </Warning>
+        </div>
 
 This `llm_config` can then be passed to an agent’s constructor to enable
 it to use the LLM.
@@ -108,11 +108,11 @@ import TabItem from '@theme/TabItem';
 
 ------------------------------------------------------------------------
 
-````mdx-code-block
-:::tip
-By default this will create a model client which assumes an OpenAI API (or compatible) endpoint. To use custom model clients, see [here](https://github.com/ag2ai/ag2/blob/main/notebook/agentchat_custom_model.ipynb).
-:::
-````
+<div class="tip">
+        <Tip>
+        By default this will create a model client which assumes an OpenAI API (or compatible) endpoint. To use custom model clients, see [here](https://github.com/ag2ai/ag2/blob/main/notebook/agentchat_custom_model.ipynb).
+        </Tip>
+        </div>
 
 ### `OAI_CONFIG_LIST` pattern
 
@@ -151,9 +151,10 @@ the agent. This is useful for a few reasons:
 
 -   If one model times out or fails, the agent can try another model.
 -   Having a single global list of models and [filtering
-    it](#config-list-filtering) based on certain keys (e.g. name, tag)
-    in order to pass select models into a certain agent (e.g. use
-    cheaper GPT 3.5 for agents solving easier tasks)
+    it](../../docs/topics/llm_configuration#config-list-filtering) based
+    on certain keys (e.g. name, tag) in order to pass select models into
+    a certain agent (e.g. use cheaper GPT 3.5 for agents solving easier
+    tasks)
 -   While the core agents, (e.g. conversable or assistant) do not have
     special logic around selecting configs, some of the specialized
     agents *may* have logic to select the best model based on the task
@@ -416,7 +417,7 @@ used by Autogen and those passed into the model client.
     Otherwise, by default or if an int is passed the
     [DiskCache](../../docs/reference/cache/disk_cache) will be used. For
     the new way of using caching, pass a
-    [Cache](../../docs/reference/cache/) object into
+    [Cache](../../docs/reference/cache/cache) object into
     [`initiate_chat`](../../docs/reference/agentchat/conversable_agent#initiate_chat).
 
 ### Extra model client parameters
