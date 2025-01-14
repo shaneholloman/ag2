@@ -269,7 +269,9 @@
                     "docs/reference/agentchat/contrib/graph_rag/graph_query_engine",
                     "docs/reference/agentchat/contrib/graph_rag/graph_rag_capability",
                     "docs/reference/agentchat/contrib/graph_rag/neo4j_graph_query_engine",
-                    "docs/reference/agentchat/contrib/graph_rag/neo4j_graph_rag_capability"
+                    "docs/reference/agentchat/contrib/graph_rag/neo4j_graph_rag_capability",
+                    "docs/reference/agentchat/contrib/graph_rag/neo4j_native_graph_query_engine",
+                    "docs/reference/agentchat/contrib/graph_rag/neo4j_native_graph_rag_capability"
                   ]
                 },
                 {

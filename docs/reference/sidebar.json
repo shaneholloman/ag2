@@ -104,7 +104,9 @@
                 "reference/agentchat/contrib/graph_rag/graph_query_engine",
                 "reference/agentchat/contrib/graph_rag/graph_rag_capability",
                 "reference/agentchat/contrib/graph_rag/neo4j_graph_query_engine",
-                "reference/agentchat/contrib/graph_rag/neo4j_graph_rag_capability"
+                "reference/agentchat/contrib/graph_rag/neo4j_graph_rag_capability",
+                "reference/agentchat/contrib/graph_rag/neo4j_native_graph_query_engine",
+                "reference/agentchat/contrib/graph_rag/neo4j_native_graph_rag_capability"
               ],
               "label": "agentchat.contrib.graph_rag",
               "type": "category"
