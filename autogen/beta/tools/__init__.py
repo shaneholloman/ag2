@@ -2,10 +2,11 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from .builtin import UserLocation, WebSearchTool
+from .builtin import CodeExecutionTool, UserLocation, WebSearchTool
 from .final import Toolkit, tool
 
 __all__ = (
+    "CodeExecutionTool",
     "Toolkit",
     "UserLocation",
     "WebSearchTool",
