@@ -3,9 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+from collections.abc import Iterable
 from typing import Any
 
-from autogen.beta.events import BaseEvent, ModelRequest, ModelResponse, ToolResults
+from autogen.beta.events import BaseEvent, ModelRequest, ModelResponse, ToolResultsEvent
 from autogen.beta.exceptions import UnsupportedToolError
 from autogen.beta.tools.builtin.code_execution import CodeExecutionToolSchema
 from autogen.beta.tools.builtin.web_search import WebSearchToolSchema
@@ -54,7 +55,7 @@ def tool_to_api(t: ToolSchema) -> dict[str, Any]:
 
 
 def convert_messages(
-    messages: tuple[BaseEvent, ...],
+    messages: Iterable[BaseEvent],
 ) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
 
@@ -77,7 +78,7 @@ def convert_messages(
                 })
             if content:
                 result.append({"role": "assistant", "content": content})
-        elif isinstance(message, ToolResults):
+        elif isinstance(message, ToolResultsEvent):
             tool_results = [
                 {
                     "type": "tool_result",
