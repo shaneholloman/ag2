@@ -162,6 +162,9 @@ class OpenAIClient(LLMClient):
                 message=model_msg,
                 tool_calls=ToolCallsEvent(calls=calls),
                 usage=completion.usage.model_dump() if completion.usage else {},
+                model=completion.model,
+                provider="openai",
+                finish_reason=choice.finish_reason,
             )
 
     async def _process_stream(
@@ -171,6 +174,8 @@ class OpenAIClient(LLMClient):
     ) -> ModelResponse:
         full_content: str = ""
         usage: dict[str, Any] = {}
+        finish_reason: str | None = None
+        resolved_model: str | None = None
 
         # Accumulate tool calls by index (streaming sends partial updates per index)
         full_tool_calls: list[dict[str, str]] = []
@@ -180,7 +185,12 @@ class OpenAIClient(LLMClient):
             if chunk.usage:
                 usage = chunk.usage.model_dump()
 
+            if chunk.model:
+                resolved_model = chunk.model
+
             for choice in chunk.choices:
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
                 delta = choice.delta
 
                 if r := getattr(delta, "reasoning_content", None):
@@ -227,4 +237,7 @@ class OpenAIClient(LLMClient):
             message=message,
             tool_calls=ToolCallsEvent(calls=calls),
             usage=usage,
+            model=resolved_model,
+            provider="openai",
+            finish_reason=finish_reason,
         )
