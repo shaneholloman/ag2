@@ -11,6 +11,7 @@ from autogen.beta.exceptions import UnsupportedToolError
 from autogen.beta.response import ResponseProto
 from autogen.beta.tools.builtin.code_execution import CodeExecutionToolSchema
 from autogen.beta.tools.builtin.memory import MemoryToolSchema
+from autogen.beta.tools.builtin.shell import ShellToolSchema
 from autogen.beta.tools.builtin.web_fetch import WebFetchToolSchema
 from autogen.beta.tools.builtin.web_search import WebSearchToolSchema
 from autogen.beta.tools.final import FunctionToolSchema
@@ -128,6 +129,10 @@ def tool_to_api(
     elif isinstance(t, MemoryToolSchema):
         # https://platform.claude.com/docs/en/agents-and-tools/tool-use/memory-tool
         return {"type": "memory_20250818", "name": "memory"}
+
+    elif isinstance(t, ShellToolSchema):
+        # https://platform.claude.com/docs/en/agents-and-tools/tool-use/bash-tool
+        return {"type": "bash_20250124", "name": "bash"}
 
     raise UnsupportedToolError(t.type, "anthropic")
 

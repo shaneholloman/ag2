@@ -10,6 +10,7 @@ from autogen.beta.exceptions import UnsupportedToolError
 from autogen.beta.response import ResponseProto
 from autogen.beta.tools.builtin.code_execution import CodeExecutionToolSchema
 from autogen.beta.tools.builtin.image_generation import ImageGenerationToolSchema
+from autogen.beta.tools.builtin.shell import ContainerAutoEnvironment, ContainerReferenceEnvironment, ShellToolSchema
 from autogen.beta.tools.builtin.web_search import WebSearchToolSchema
 from autogen.beta.tools.final import FunctionToolSchema
 from autogen.beta.tools.schemas import ToolSchema
@@ -201,8 +202,27 @@ def tool_to_responses_api(t: ToolSchema) -> dict[str, Any]:
         return result
 
     elif isinstance(t, CodeExecutionToolSchema):
-        # https://platform.openai.com/docs/api-reference/responses/create#responses-create-tools
+        # https://developers.openai.com/api/docs/guides/tools-code-interpreter
         return {"type": "code_interpreter", "container": {"type": "auto"}}
+
+    elif isinstance(t, ShellToolSchema):
+        # https://developers.openai.com/api/docs/guides/tools-shell
+        result_shell: dict[str, Any] = {"type": "shell"}
+        if t.environment is not None:
+            env: dict[str, Any]
+            if isinstance(t.environment, ContainerAutoEnvironment):
+                env = {"type": "container_auto"}
+                if t.environment.network_policy is not None:
+                    env["network_policy"] = {
+                        "type": "allowlist",
+                        "allowed_domains": t.environment.network_policy.allowed_domains,
+                    }
+            elif isinstance(t.environment, ContainerReferenceEnvironment):
+                env = {"type": "container_reference", "container_id": t.environment.container_id}
+            else:
+                env = {"type": "local"}
+            result_shell["environment"] = env
+        return result_shell
 
     elif isinstance(t, ImageGenerationToolSchema):
         result: dict[str, Any] = {"type": "image_generation"}

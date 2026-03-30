@@ -6,8 +6,13 @@ from autogen.beta.events.tool_events import ToolResult
 
 from .builtin import (
     CodeExecutionTool,
+    ContainerAutoEnvironment,
+    ContainerReferenceEnvironment,
     ImageGenerationTool,
+    LocalEnvironment,
     MemoryTool,
+    NetworkPolicy,
+    ShellTool,
     UserLocation,
     WebFetchCitations,
     WebFetchTool,
@@ -17,8 +22,13 @@ from .final import Toolkit, tool
 
 __all__ = (
     "CodeExecutionTool",
+    "ContainerAutoEnvironment",
+    "ContainerReferenceEnvironment",
     "ImageGenerationTool",
+    "LocalEnvironment",
     "MemoryTool",
+    "NetworkPolicy",
+    "ShellTool",
     "ToolResult",
     "Toolkit",
     "UserLocation",

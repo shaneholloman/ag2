@@ -2,7 +2,6 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from __future__ import annotations
 
 import base64
 from collections.abc import Iterable, Sequence

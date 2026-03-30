@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from autogen.beta.config.anthropic.mappers import tool_to_api
+from autogen.beta.tools.builtin.memory import MemoryToolSchema
+from autogen.beta.tools.builtin.shell import ContainerAutoEnvironment, ShellToolSchema
 from autogen.beta.tools.builtin.web_fetch import WebFetchCitations, WebFetchToolSchema
 from autogen.beta.tools.builtin.web_search import UserLocation, WebSearchToolSchema
 
@@ -75,6 +77,31 @@ def test_tool_to_api_web_search_with_user_location() -> None:
             "timezone": "Europe/London",
         },
     }
+
+
+def test_tool_to_api_memory() -> None:
+    schema = MemoryToolSchema()
+
+    result = tool_to_api(schema)
+
+    assert result == {"type": "memory_20250818", "name": "memory"}
+
+
+def test_tool_to_api_shell() -> None:
+    schema = ShellToolSchema()
+
+    result = tool_to_api(schema)
+
+    assert result == {"type": "bash_20250124", "name": "bash"}
+
+
+def test_tool_to_api_shell_ignores_environment() -> None:
+    # Anthropic maps to bash regardless of the environment field
+    schema = ShellToolSchema(environment=ContainerAutoEnvironment())
+
+    result = tool_to_api(schema)
+
+    assert result == {"type": "bash_20250124", "name": "bash"}
 
 
 def test_tool_to_api_web_search_with_allowed_domains() -> None:
