@@ -4,7 +4,15 @@
 
 from autogen.beta.events.tool_events import ToolResult
 
-from .builtin import CodeExecutionTool, ImageGenerationTool, MemoryTool, UserLocation, WebSearchTool
+from .builtin import (
+    CodeExecutionTool,
+    ImageGenerationTool,
+    MemoryTool,
+    UserLocation,
+    WebFetchCitations,
+    WebFetchTool,
+    WebSearchTool,
+)
 from .final import Toolkit, tool
 
 __all__ = (
@@ -14,6 +22,8 @@ __all__ = (
     "ToolResult",
     "Toolkit",
     "UserLocation",
+    "WebFetchCitations",
+    "WebFetchTool",
     "WebSearchTool",
     "tool",
 )
