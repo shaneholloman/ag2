@@ -85,6 +85,7 @@ setuptools.setup(
         "cerebras": ["ag2[cerebras]==" + __version__],
         "yepcode": ["ag2[yepcode]==" + __version__],
         "remyx": ["ag2[remyx]==" + __version__],
+        "daytona": ["ag2[daytona]==" + __version__],
         "cohere": ["ag2[cohere]==" + __version__],
         "commsagent-discord": ["ag2[commsagent-discord]==" + __version__],
         "commsagent-slack": ["ag2[commsagent-slack]==" + __version__],
