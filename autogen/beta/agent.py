@@ -44,6 +44,7 @@ from .utils import CONTEXT_OPTION_NAME, build_model
 
 if TYPE_CHECKING:
     from .conversable import ConversableAdapter
+    from .tools.subagents import StreamFactory
 
 
 TResult = TypeVar313("TResult", default=str)
@@ -319,7 +320,7 @@ class Agent(Generic[TResult]):
         self.dependency_provider = Provider()
         self.tools = [FunctionTool.ensure_tool(t, provider=self.dependency_provider) for t in tools]
 
-        self.__hitl_hook = wrap_hitl(hitl_hook) if hitl_hook else default_hitl_hook
+        self._hitl_hook = wrap_hitl(hitl_hook) if hitl_hook else None
         self.__tool_executor = ToolExecutor()
 
         self._system_prompt: list[str] = []
@@ -337,14 +338,14 @@ class Agent(Generic[TResult]):
                 self._dynamic_prompt.append(_wrap_prompt_hook(p))
 
     def hitl_hook(self, func: HumanHook) -> HumanHook:
-        if self.__hitl_hook is not default_hitl_hook:
+        if self._hitl_hook is not None:
             warnings.warn(
                 "You already set HITL hook, provided value overrides it",
                 category=RuntimeWarning,
                 stacklevel=2,
             )
 
-        self.__hitl_hook = wrap_hitl(func)
+        self._hitl_hook = wrap_hitl(func)
         return func
 
     @overload
@@ -395,6 +396,10 @@ class Agent(Generic[TResult]):
         middleware: Iterable[ToolMiddleware] = (),
     ) -> Callable[[Callable[..., Any]], Tool]: ...
 
+    def add_tool(self, t: Callable[..., Any] | Tool) -> "Agent[TResult]":
+        self.tools.append(FunctionTool.ensure_tool(t, provider=self.dependency_provider))
+        return self
+
     def tool(
         self,
         function: Callable[..., Any] | None = None,
@@ -414,8 +419,7 @@ class Agent(Generic[TResult]):
                 sync_to_thread=sync_to_thread,
                 middleware=middleware,
             )
-            t = FunctionTool.ensure_tool(t, provider=self.dependency_provider)
-            self.tools.append(t)
+            self.add_tool(t)
             return t
 
         if function:
@@ -626,10 +630,8 @@ class Agent(Generic[TResult]):
             llm_call = partial(mw.on_llm_call, llm_call)
 
         async def _call_client(context: Context) -> None:
-            result = await llm_call(
-                await context.stream.history.get_events(),
-                context,
-            )
+            messages = await context.stream.history.get_events()
+            result = await llm_call(messages, context)
             await context.send(result)
 
         with ExitStack() as stack:
@@ -637,10 +639,21 @@ class Agent(Generic[TResult]):
                 context.stream.where(ModelRequest | ToolResultsEvent).sub_scope(_call_client),
             )
 
-            hitl_hook_maker = wrap_hitl(hitl_hook) if hitl_hook else self.__hitl_hook
-            stack.enter_context(
-                context.stream.where(HumanInputRequest).sub_scope(hitl_hook_maker(middleware_instances)),
-            )
+            hitl_hook_maker = wrap_hitl(hitl_hook) if hitl_hook else self._hitl_hook
+            if hitl_hook_maker is not None:
+                stack.enter_context(
+                    context.stream.where(HumanInputRequest).sub_scope(
+                        hitl_hook_maker(middleware_instances),
+                        interrupt=True,
+                    ),
+                )
+
+            else:
+                stack.enter_context(
+                    context.stream.where(HumanInputRequest).sub_scope(
+                        default_hitl_hook(middleware_instances),
+                    ),
+                )
 
             self.__tool_executor.register(
                 stack,
@@ -663,6 +676,24 @@ class Agent(Generic[TResult]):
                 provider=self.dependency_provider,
                 response_schema=final_schema,
             )
+
+    def as_tool(
+        self,
+        *,
+        description: str,
+        name: str | None = None,
+        stream: "StreamFactory | None" = None,
+        middleware: Iterable[ToolMiddleware] = (),
+    ) -> FunctionTool:
+        from .tools.subagents import subagent_tool
+
+        return subagent_tool(
+            self,
+            description=description,
+            name=name,
+            stream=stream,
+            middleware=middleware,
+        )
 
     def as_conversable(self) -> "ConversableAdapter":
         from .conversable import ConversableAdapter
