@@ -28,7 +28,6 @@ class LocalSkillsTool(Toolkit):
     Works with *any* provider (no provider-specific API required).
 
     Example::
-
         # Default runtime (.agents/skills + ~/.agents/skills)
         LocalSkillsTool()
 
@@ -48,7 +47,6 @@ class LocalSkillsTool(Toolkit):
         runtime: SkillRuntime | None = None,
     ) -> None:
         _runtime: SkillRuntime = runtime if runtime is not None else LocalRuntime()
-
         self.list_skills = _make_list_tool(_runtime)
         self.load_skill = _make_load_tool(_runtime)
         self.run_skill_script = _make_run_tool(_runtime)
