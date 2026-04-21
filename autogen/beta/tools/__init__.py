@@ -20,7 +20,7 @@ from .builtin import (
     WebSearchTool,
 )
 from .final import Toolkit, tool
-from .search import DuckDuckSearchTool
+from .search import DuckDuckSearchTool, TavilySearchTool
 from .shell import LocalShellTool
 from .skills import SkillSearchToolkit, SkillsToolkit
 from .toolkits import FilesystemToolkit
@@ -41,6 +41,7 @@ __all__ = (
     "SkillSearchToolkit",
     "SkillsTool",
     "SkillsToolkit",
+    "TavilySearchTool",
     "ToolResult",
     "Toolkit",
     "UserLocation",

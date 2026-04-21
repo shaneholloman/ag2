@@ -4,4 +4,5 @@
 
 import pytest
 
+pytest.importorskip("tavily")
 pytest.importorskip("ddgs")
