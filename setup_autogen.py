@@ -92,6 +92,7 @@ setuptools.setup(
         "commsagent-slack": ["ag2[commsagent-slack]==" + __version__],
         "commsagent-telegram": ["ag2[commsagent-telegram]==" + __version__],
         "duckduckgo": ["ag2[duckduckgo]==" + __version__],
+        "ddgs": ["ag2[ddgs]==" + __version__],
         "tavily": ["ag2[tavily]==" + __version__],
         "nlip": ["ag2[nlip]==" + __version__],
         "test-core": ["ag2[test-core]==" + __version__],

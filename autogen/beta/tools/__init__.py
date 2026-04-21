@@ -20,6 +20,7 @@ from .builtin import (
     WebSearchTool,
 )
 from .final import Toolkit, tool
+from .search import DuckDuckSearchTool
 from .shell import LocalShellTool
 from .skills import SkillSearchToolkit, SkillsToolkit
 from .toolkits import FilesystemToolkit
@@ -28,6 +29,7 @@ __all__ = (
     "CodeExecutionTool",
     "ContainerAutoEnvironment",
     "ContainerReferenceEnvironment",
+    "DuckDuckSearchTool",
     "FilesystemToolkit",
     "ImageGenerationTool",
     "LocalShellTool",
