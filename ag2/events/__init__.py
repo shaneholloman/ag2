@@ -32,6 +32,7 @@ from .lifecycle import (
     ObserverStarted,
     UnknownEvent,
 )
+from .sizing import estimated_tokens, render_for_prompt
 from .task_events import (
     TaskCancelled,
     TaskCompleted,
@@ -129,5 +130,7 @@ __all__ = (
     "Usage",
     "UsageEvent",
     "VideoInput",
+    "estimated_tokens",
     "is_conversational",
+    "render_for_prompt",
 )
