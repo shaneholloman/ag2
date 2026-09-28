@@ -25,6 +25,7 @@ from mcp.types import Tool as MCPTool
 
 from ag2 import Agent, Context, Variable
 from ag2.events import BinaryInput, BinaryType, TextInput, ToolCallEvent, ToolResultEvent, UrlInput
+from ag2.exceptions import ToolConflictError
 from ag2.testing import TestConfig
 from ag2.tools import MCPStdioServerConfig, MCPToolkit
 from ag2.tools.toolkits.mcp_server import toolkit as _toolkit_module
@@ -221,7 +222,7 @@ async def test_prefixes_keep_two_servers_exposing_the_same_tool_name_apart(
     patch_mcp_session: MCPSessionPatch,
     context: Context,
 ) -> None:
-    """Without prefixes both proxies answer one call; with them, only the addressed one does."""
+    """With prefixes, only the addressed proxy answers a call."""
     session = patch_mcp_session([MCPTool(name="search", description="", inputSchema={"type": "object"})])
     github = MCPToolkit(MCPStdioServerConfig(command="github-mcp", tool_name_prefix="github_"))
     docs = MCPToolkit(MCPStdioServerConfig(command="docs-mcp", tool_name_prefix="docs_"))
@@ -241,6 +242,30 @@ async def test_prefixes_keep_two_servers_exposing_the_same_tool_name_apart(
     assert result.body == "done"
     assert [s.function.name for s in schemas] == ["github_search", "docs_search"]
     assert session.calls == [("search", {})]
+
+
+@pytest.mark.asyncio
+async def test_discovered_tool_sharing_a_local_tool_name_is_rejected(
+    patch_mcp_session: MCPSessionPatch,
+) -> None:
+    session = patch_mcp_session([MCPTool(name="deploy", description="", inputSchema={"type": "object"})])
+    local_runs: list[str] = []
+
+    def deploy() -> str:
+        local_runs.append("local")
+        return "deployed"
+
+    agent = Agent(
+        name="test",
+        tools=[deploy, MCPToolkit(MCPStdioServerConfig(command="x", server_label="ops"))],
+        config=TestConfig(ToolCallEvent(name="deploy", arguments="{}"), "done"),
+    )
+
+    with pytest.raises(ToolConflictError, match=r"`deploy`.*FunctionTool\('deploy'\), MCPToolkit\('ops'\)"):
+        await agent.ask("deploy")
+
+    assert local_runs == []
+    assert session.calls == []
 
 
 @pytest.mark.asyncio

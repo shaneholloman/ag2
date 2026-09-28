@@ -126,6 +126,9 @@ def math_op(a: int, b: int) -> int:
 !!! note
     Explicitly setting the name and description overrides the automatically generated values.
 
+!!! note
+    A tool name must be unique among all the tools an agent exposes in a turn: its own tools, tools passed to `ask()`, toolkits, and tools an MCP server reports at runtime. The model calls tools by name only, so a duplicate name makes the agent raise `ToolConflictError` naming both sources before the turn starts.
+
 ### Deep Schema Customization with Pydantic
 
 Under the hood, arguments are serialized and validated using [Pydantic](https://docs.pydantic.dev/latest/){.external-link target="_blank"} schemas. This means you can use standard `pydantic.Field` annotations to deeply customize individual schema parameters, providing the LLM with strict guidelines on what values are acceptable.

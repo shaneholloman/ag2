@@ -14,7 +14,8 @@ from ag2.events import HumanInputRequest, ModelRequest, ObserverCompleted, Obser
 from ag2.middleware.base import BaseMiddleware, MiddlewareFactory
 from ag2.observers import Observer
 from ag2.stream import MemoryStream
-from ag2.tools.final import FunctionTool, FunctionToolSchema
+from ag2.tools.executor import resolve_tool_schemas
+from ag2.tools.final import FunctionTool
 from ag2.tools.schemas import ToolSchema
 from ag2.tools.tool import Tool
 from ag2.usage import UsageReport
@@ -143,16 +144,7 @@ class LiveAgent(PluginTarget):
                     ),
                 )
 
-            all_schemas: list[ToolSchema] = []
-            known_tools: set[str] = set()
-            for t in all_tools:
-                schemas = await t.schemas(context)
-                all_schemas.extend(schemas)
-                for schema in schemas:
-                    if isinstance(schema, FunctionToolSchema):
-                        known_tools.add(schema.function.name)
-                    else:
-                        known_tools.add(schema.type)
+            all_schemas, known_tools = await resolve_tool_schemas(all_tools, context)
 
             if all_tools:
                 self._tool_executor.register(

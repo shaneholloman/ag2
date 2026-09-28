@@ -168,7 +168,7 @@ toolkit = MCPToolkit(
 ```
 
 !!! warning
-    Namespacing is opt-in. Two servers exposing the same tool name **without** distinct prefixes still collide: both proxies answer the same tool call, so the tool runs twice for one request.
+    Namespacing is opt-in. If two servers, or a server and a local tool, expose the same tool name **without** distinct prefixes, the agent raises `ToolConflictError` naming both sources when the turn starts.
 
 ### Declare what a server may ask you for
 

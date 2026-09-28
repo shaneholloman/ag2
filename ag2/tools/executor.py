@@ -23,10 +23,52 @@ from ag2.events import (
     ToolResultEvent,
     ToolResultsEvent,
 )
-from ag2.exceptions import HumanInputError, ToolNotFoundError
+from ag2.exceptions import HumanInputError, ToolConflictError, ToolNotFoundError
 from ag2.middleware import BaseMiddleware
 
+from .final import FunctionToolSchema
+from .schemas import ToolSchema
 from .tool import Tool
+
+
+async def resolve_tool_schemas(
+    tools: Iterable["Tool"],
+    context: "Context",
+) -> tuple[list["ToolSchema"], set[str]]:
+    """Resolve the schemas ``tools`` expose for a turn and the names calls reach them by.
+
+    A ``ToolCallEvent`` is dispatched by name to every tool subscribed to it,
+    and the model tells tools apart only by name, so each callable name must
+    belong to exactly one tool. A function name exposed twice, or equal to a
+    built-in tool's name, raises :class:`~ag2.exceptions.ToolConflictError`
+    naming both sources. Built-in schemas of one type may repeat (e.g. several
+    ``MCPServerTool`` servers).
+
+    Runs on the tools resolved for the turn, so names a toolkit discovers at
+    runtime (e.g. from an MCP server) are checked too.
+    """
+    schemas: list[ToolSchema] = []
+    functions: dict[str, Tool] = {}
+    builtins: dict[str, Tool] = {}
+    for tool in tools:
+        for schema in await tool.schemas(context):
+            schemas.append(schema)
+            if isinstance(schema, FunctionToolSchema):
+                name = schema.function.name
+                owner = functions.get(name, builtins.get(name))
+                if owner is not None:
+                    raise ToolConflictError(name, sources=(_describe_tool(owner), _describe_tool(tool)))
+                functions[name] = tool
+            else:
+                owner = functions.get(schema.type)
+                if owner is not None:
+                    raise ToolConflictError(schema.type, sources=(_describe_tool(owner), _describe_tool(tool)))
+                builtins.setdefault(schema.type, tool)
+    return schemas, functions.keys() | builtins.keys()
+
+
+def _describe_tool(tool: "Tool") -> str:
+    return f"{type(tool).__name__}({tool.name!r})"
 
 
 class ToolExecutor:
