@@ -83,8 +83,8 @@ from .response import ResponseProto, ResponseSchema
 from .stream import MemoryStream, Stream, StreamId
 from .task import CheckpointStore, Task, TaskSpec
 from .tools.builtin.tool_search import ToolSearchToolSchema
-from .tools.executor import resolve_tool_schemas
 from .tools.final import FunctionTool, Toolkit, tool
+from .tools.precedence import resolve_tools
 from .tools.schemas import ToolSchema
 from .tools.subagents.run_task import run_task as _run_task
 from .tools.subagents.subagent_tool import StreamOrFactory, subagent_tool
@@ -1349,8 +1349,8 @@ class Agent(PluginTarget, Generic[TResult]):
 
             all_schemas: list[ToolSchema] = []
             tool_search_schema: ToolSearchToolSchema | None = None
-            schemas, known_tools = await resolve_tool_schemas(all_tools, context)
-            for schema in schemas:
+            resolved_tools = await resolve_tools(all_tools, context)
+            for schema in resolved_tools.schemas:
                 if isinstance(schema, ToolSearchToolSchema):
                     tool_search_schema = schema
                 else:
@@ -1436,8 +1436,8 @@ class Agent(PluginTarget, Generic[TResult]):
                 self._tool_executor.register(
                     stack,
                     context,
-                    tools=all_tools,
-                    known_tools=known_tools,
+                    tools=resolved_tools.tools,
+                    known_tools=resolved_tools.known_tools,
                     middleware=middleware_instances,
                 )
 

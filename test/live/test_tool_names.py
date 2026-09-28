@@ -7,19 +7,32 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from ag2.exceptions import ToolConflictError
+from ag2 import tool
+from ag2.events import ToolCallEvent
 from ag2.live import LiveAgent
 
 
 @pytest.mark.asyncio
-async def test_session_rejects_two_tools_sharing_a_name() -> None:
-    def deploy() -> str:
+async def test_session_dispatches_a_shared_name_to_the_later_tool() -> None:
+    runs: list[str] = []
+
+    @tool(name="deploy")
+    def agent_deploy() -> str:
+        runs.append("agent")
+        return "deployed"
+
+    @tool(name="deploy")
+    def run_deploy() -> str:
+        runs.append("run")
         return "deployed"
 
     config = MagicMock()
     config.session.return_value = nullcontext()
-    agent = LiveAgent("live", config=config, tools=[deploy])
+    agent = LiveAgent("live", config=config, tools=[agent_deploy])
 
-    with pytest.raises(ToolConflictError, match="`deploy`"):
-        async with agent.run(tools=[deploy]):
-            pass
+    async with agent.run(tools=[run_deploy]) as context:
+        await context.send(ToolCallEvent(name="deploy", arguments="{}"))
+
+    assert runs == ["run"]
+    [schema] = config.session.call_args.kwargs["tools"]
+    assert schema.function.name == "deploy"

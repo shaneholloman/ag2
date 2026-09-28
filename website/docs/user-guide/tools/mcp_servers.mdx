@@ -168,7 +168,7 @@ toolkit = MCPToolkit(
 ```
 
 !!! warning
-    Namespacing is opt-in. If two servers, or a server and a local tool, expose the same tool name **without** distinct prefixes, the agent raises `ToolConflictError` naming both sources when the turn starts.
+    Namespacing is opt-in. A tool an MCP server reports never replaces a tool declared in code with the same name, wherever the toolkit sits in the list. The server's tool is dropped with a warning. If two servers expose the same name without distinct prefixes, the first server's tool wins and the others are dropped with a warning. To use a server's tool anyway, remove the local tool or set a `tool_name_prefix`.
 
 ### Declare what a server may ask you for
 

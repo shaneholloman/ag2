@@ -176,6 +176,8 @@ class _MCPProxyTool(Tool):
 
     __slots__ = ("name", "schema", "_config", "_middleware", "_answering", "_remote_name")
 
+    declared_in_code = False
+
     def __init__(
         self,
         config: AnyMCPConfig,

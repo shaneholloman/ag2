@@ -10,12 +10,9 @@ import pytest
 from dirty_equals import IsPartialDict
 from pydantic import BaseModel
 
-from ag2 import Agent, ToolResult, tool
+from ag2 import Agent, ToolResult, Toolkit, tool
 from ag2.events import ModelResponse, ToolCallEvent, ToolCallsEvent
-from ag2.exceptions import ToolConflictError
-from ag2.middleware import approval_required
 from ag2.testing import TestConfig
-from ag2.tools import AnthropicBashTool
 
 DEFAULT_SCHEMA = {
     "function": {
@@ -171,43 +168,26 @@ async def test_concurrent_tool_execution() -> None:
 
 
 @pytest.mark.asyncio()
-async def test_denied_call_runs_no_tool_when_two_tools_share_its_name() -> None:
+async def test_later_declared_tool_overrides_an_earlier_one_silently(caplog: pytest.LogCaptureFixture) -> None:
     runs: list[str] = []
 
-    @tool(name="deploy", middleware=[approval_required()])
-    def guarded_deploy() -> str:
-        runs.append("guarded")
+    def deploy() -> str:
+        runs.append("toolkit")
         return "deployed"
 
     @tool(name="deploy")
-    def unguarded_deploy() -> str:
-        runs.append("unguarded")
+    def my_deploy() -> str:
+        runs.append("mine")
         return "deployed"
 
     agent = Agent(
         "",
-        tools=[guarded_deploy, unguarded_deploy],
+        tools=[Toolkit(deploy), my_deploy],
         config=TestConfig(ToolCallEvent(name="deploy", arguments="{}"), "done"),
     )
 
-    with pytest.raises(ToolConflictError, match="`deploy`"):
-        await agent.ask("Deploy", hitl_hook=lambda _: "n")
+    with caplog.at_level("WARNING"):
+        await agent.ask("Deploy")
 
-    assert runs == []
-
-
-@pytest.mark.asyncio()
-@pytest.mark.parametrize("builtin_first", [True, False], ids=["builtin-first", "function-first"])
-async def test_function_tool_cannot_take_a_builtin_tool_name(builtin_first: bool) -> None:
-    def bash(command: str) -> str:
-        return command
-
-    builtin = AnthropicBashTool()
-    agent = Agent(
-        "",
-        tools=[builtin, bash] if builtin_first else [bash, builtin],
-        config=TestConfig("done"),
-    )
-
-    with pytest.raises(ToolConflictError, match="`bash`"):
-        await agent.ask("Hi!")
+    assert runs == ["mine"]
+    assert caplog.records == []

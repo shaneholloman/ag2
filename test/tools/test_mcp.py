@@ -25,9 +25,9 @@ from mcp.types import Tool as MCPTool
 
 from ag2 import Agent, Context, Variable
 from ag2.events import BinaryInput, BinaryType, TextInput, ToolCallEvent, ToolResultEvent, UrlInput
-from ag2.exceptions import ToolConflictError
+from ag2.middleware import approval_required
 from ag2.testing import TestConfig
-from ag2.tools import MCPStdioServerConfig, MCPToolkit
+from ag2.tools import MCPStdioServerConfig, MCPToolkit, tool
 from ag2.tools.toolkits.mcp_server import toolkit as _toolkit_module
 from ag2.tools.types import FunctionToolSchema
 
@@ -245,8 +245,33 @@ async def test_prefixes_keep_two_servers_exposing_the_same_tool_name_apart(
 
 
 @pytest.mark.asyncio
-async def test_discovered_tool_sharing_a_local_tool_name_is_rejected(
+async def test_denied_local_tool_is_not_replaced_by_a_same_name_mcp_tool(
     patch_mcp_session: MCPSessionPatch,
+) -> None:
+    session = patch_mcp_session([MCPTool(name="deploy", description="", inputSchema={"type": "object"})])
+    local_runs: list[str] = []
+
+    @tool(middleware=[approval_required()])
+    def deploy() -> str:
+        local_runs.append("local")
+        return "deployed"
+
+    agent = Agent(
+        name="test",
+        tools=[deploy, MCPToolkit(MCPStdioServerConfig(command="x"))],
+        config=TestConfig(ToolCallEvent(name="deploy", arguments="{}"), "done"),
+    )
+
+    await agent.ask("deploy", hitl_hook=lambda _: "n")
+
+    assert local_runs == []
+    assert session.calls == []
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_sharing_a_declared_tool_name_is_dropped_with_a_warning(
+    patch_mcp_session: MCPSessionPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     session = patch_mcp_session([MCPTool(name="deploy", description="", inputSchema={"type": "object"})])
     local_runs: list[str] = []
@@ -261,11 +286,39 @@ async def test_discovered_tool_sharing_a_local_tool_name_is_rejected(
         config=TestConfig(ToolCallEvent(name="deploy", arguments="{}"), "done"),
     )
 
-    with pytest.raises(ToolConflictError, match=r"`deploy`.*FunctionTool\('deploy'\), MCPToolkit\('ops'\)"):
+    with caplog.at_level("WARNING", logger="ag2.tools.precedence"):
         await agent.ask("deploy")
 
-    assert local_runs == []
+    assert local_runs == ["local"]
     assert session.calls == []
+    [record] = caplog.records
+    assert "MCPToolkit('ops') > _MCPProxyTool('deploy')" in record.message
+    assert "FunctionTool('deploy')" in record.message
+
+
+@pytest.mark.asyncio
+async def test_first_mcp_server_wins_a_shared_tool_name(
+    patch_mcp_session: MCPSessionPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    session = patch_mcp_session([MCPTool(name="search", description="", inputSchema={"type": "object"})])
+    agent = Agent(
+        name="test",
+        tools=[
+            MCPToolkit(MCPStdioServerConfig(command="x", server_label="first")),
+            MCPToolkit(MCPStdioServerConfig(command="y", server_label="second")),
+        ],
+        config=TestConfig(ToolCallEvent(name="search", arguments="{}"), "done"),
+    )
+
+    with caplog.at_level("WARNING", logger="ag2.tools.precedence"):
+        await agent.ask("search")
+
+    assert session.calls == [("search", {})]
+    [record] = caplog.records
+    assert "reported by MCPToolkit('second')" in record.message
+    assert "MCPToolkit('first') > _MCPProxyTool('search') already provides it" in record.message
+    assert "tool_name_prefix" in record.message
 
 
 @pytest.mark.asyncio

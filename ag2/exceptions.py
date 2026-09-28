@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 from unittest.mock import Mock
 
 
@@ -11,18 +11,8 @@ class AG2Error(Exception):
 
 
 class ToolConflictError(AG2Error):
-    """Raised when two tools answer to the same name.
-
-    ``sources`` names the tools that expose it, when they are known.
-    """
-
-    def __init__(self, tool_name: str, *, sources: Sequence[str] = ()) -> None:
-        self.tool_name = tool_name
-        self.sources = tuple(sources)
-        message = f"Could not add tool: `{tool_name}`. Tool with such name already registered."
-        if self.sources:
-            message += f" Exposed by: {', '.join(self.sources)}. Give each tool a unique name."
-        super().__init__(message)
+    def __init__(self, tool_name: str) -> None:
+        super().__init__(f"Could not add tool: `{tool_name}`. Tool with such name already registered.")
 
 
 class ToolResolutionError(AG2Error):
