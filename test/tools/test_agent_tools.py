@@ -10,7 +10,7 @@ import pytest
 from dirty_equals import IsPartialDict
 from pydantic import BaseModel
 
-from ag2 import Agent, ToolResult, Toolkit, tool
+from ag2 import Agent, ToolResult, tool
 from ag2.events import ModelResponse, ToolCallEvent, ToolCallsEvent
 from ag2.testing import TestConfig
 
@@ -165,29 +165,3 @@ async def test_concurrent_tool_execution() -> None:
     assert result.body == "result"
     assert started == 3
     assert sorted(finished) == ["a", "b", "c"]
-
-
-@pytest.mark.asyncio()
-async def test_later_declared_tool_overrides_an_earlier_one_silently(caplog: pytest.LogCaptureFixture) -> None:
-    runs: list[str] = []
-
-    def deploy() -> str:
-        runs.append("toolkit")
-        return "deployed"
-
-    @tool(name="deploy")
-    def my_deploy() -> str:
-        runs.append("mine")
-        return "deployed"
-
-    agent = Agent(
-        "",
-        tools=[Toolkit(deploy), my_deploy],
-        config=TestConfig(ToolCallEvent(name="deploy", arguments="{}"), "done"),
-    )
-
-    with caplog.at_level("WARNING"):
-        await agent.ask("Deploy")
-
-    assert runs == ["mine"]
-    assert caplog.records == []

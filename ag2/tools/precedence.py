@@ -44,10 +44,11 @@ async def resolve_tools(tools: Iterable[Tool], context: Context) -> ResolvedTool
     Precedence, when two tools share a name:
 
     * Tools declared in code override each other in order: the later one wins,
-      like a dict update. Built-in tools count as declared in code.
-    * A tool an MCP server reports at runtime never overrides one declared in
-      code, wherever its toolkit sits; it is dropped with a warning.
-    * Between two MCP servers, the first server's tool wins; the other is
+      like a dict update, with a warning. Built-in tools count as declared in code.
+    * A tool a remote peer provides at runtime (an MCP server's tool, a tool a
+      client sends) never overrides one declared in code, wherever it sits; it
+      is dropped with a warning.
+    * Between two remote peers, the first one's tool wins; the other is
       dropped with a warning.
 
     Built-in schemas of one type may repeat (e.g. several ``MCPServerTool``
@@ -94,8 +95,8 @@ def _select(leaves: list[_Leaf]) -> list[bool]:
                 if (is_function or rival_is_function) and rival not in rivals:
                     rivals.append(rival)
 
-        # A tool declared in code wins over every rival; a tool an MCP server
-        # reports loses to any rival already in place.
+        # A tool declared in code wins over every rival; a tool a remote peer
+        # provides loses to any rival already in place.
         if rivals and not leaf.tool.declared_in_code:
             _report(rivals[0], leaf)
             continue
@@ -116,19 +117,19 @@ def _select(leaves: list[_Leaf]) -> list[bool]:
 def _report(winner: _Leaf, loser: _Leaf) -> None:
     name = next(n for n, _ in loser.keys if any(n == w for w, _ in winner.keys))
     if loser.tool.declared_in_code:
-        logger.debug("Tool `%s` from %s is overridden by %s.", name, loser.source, winner.source)
+        logger.warning("Tool `%s` from %s is overridden by %s.", name, loser.source, winner.source)
     elif winner.tool.declared_in_code:
         logger.warning(
-            "Tool `%s` reported by %s is ignored: %s declares a tool with that name, "
-            "and tools declared in code take precedence over tools an MCP server reports.",
+            "Tool `%s` provided by %s is ignored: %s declares a tool with that name, "
+            "and tools declared in code take precedence over tools a remote peer provides.",
             name,
             loser.source,
             winner.source,
         )
     else:
         logger.warning(
-            "Tool `%s` reported by %s is ignored: %s already provides it. "
-            "Set `tool_name_prefix` on the MCP server config to keep both.",
+            "Tool `%s` provided by %s is ignored: %s already provides it. "
+            "If the tools come from MCP servers, set `tool_name_prefix` on a server config to keep both.",
             name,
             loser.source,
             winner.source,

@@ -17,7 +17,10 @@ class Tool(ABC):
     name: str
 
     declared_in_code: ClassVar[bool] = True
-    """``False`` for a tool a remote server reports at runtime; tools declared in code take precedence over it."""
+    """``False`` for a tool a remote peer (an MCP server, a client) provides at runtime.
+
+    Tools declared in code take precedence over it.
+    """
 
     async def schemas(self, context: "Context") -> Iterable[ToolSchema]: ...
 
