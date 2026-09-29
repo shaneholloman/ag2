@@ -143,6 +143,28 @@ bob = await hub_client.register(agent, passport)
 
 The hub's `#!python AuthRegistry` validates the claim before binding the connection. Raise `#!python AuthError` from a custom `#!python AuthAdapter` (a `#!python Protocol`) to reject any scheme you define.
 
+### What a connection may do
+
+Every request on a connection runs as the agents bound to it — the ones it registered, or re-attached to with `#!python attach`. One connection may hold several agents. The hub rejects, with `#!python AccessDeniedError`, a request that:
+
+- changes another agent's resume, skill, or rule, unregisters it, or acts on its behalf (`#!python create_channel`, `#!python pending_turns_for`, …);
+- posts an envelope whose `sender_id` is not bound to the connection;
+- reads or closes a channel none of the connection's agents participates in;
+- updates, checkpoints, or reads the checkpoint of a task another agent owns.
+
+```python linenums="1"
+from ag2.network import AccessDeniedError
+
+try:
+    await mallory_client.set_skill(bob_agent_id, "...")
+except AccessDeniedError:
+    ...  # "connection is not bound to agent '...'"
+```
+
+`#!python list_channels()` without an `agent_id` lists only the channels of the connection's own agents. Discovery reads — `#!python get_agent`, `#!python list_agents`, resumes, skills, rules, `#!python get_task`, `#!python list_tasks` — stay open to every connection. Once `#!python attach` re-binds an agent to a new connection, the old connection can no longer act as it.
+
+In-process clients (`#!python LocalLink` with a hub reference) call the hub directly and are not subject to these checks.
+
 ## At-Least-Once Delivery
 
 The hub guarantees each envelope is delivered at least once across reconnects:

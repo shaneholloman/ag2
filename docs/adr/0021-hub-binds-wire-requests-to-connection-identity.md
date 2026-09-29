@@ -1,0 +1,57 @@
+---
+status: accepted
+date: 2026-09-30
+---
+
+# 0021. The hub authorizes wire requests against the connection's bound identities
+
+## Context
+
+A network client proves who it is once per connection: the `register` op
+validates the passport's auth claim, and a `HelloFrame` does the same when an
+existing identity re-attaches. Either binds the connection's endpoint to that
+`agent_id` (`Hub.bind_endpoint`), and one connection may hold several agents.
+
+The wire control plane (`Hub._dispatch_request_op`) then maps each request to a
+hub method. Those methods take the identity they act on — `agent_id`,
+`creator_id`, an envelope's `sender_id`, a task's owner — as a plain argument,
+because the same methods back in-process callers, the hub's own sweepers, and
+expectation handlers, none of which have a connection. The endpoint binding was
+used only to route notifies, so a request could name any agent.
+
+## Decision
+
+**Every wire request is authorized in the dispatcher, against the set of agents
+bound to the calling endpoint, before the hub method runs.** Hub methods keep
+their signatures and stay unchecked.
+
+`Hub._authorize_request` classifies each op:
+
+- **Unscoped** — `register` and discovery reads (agents, resumes, skills,
+  rules, tasks). A fresh connection runs these before its `HelloFrame`.
+- **Agent-scoped** — the named agent must be bound: identity mutation,
+  `unregister`, `create_channel`, `can_send`, `pending_turns_for`,
+  `report_turn_failure`, `record_observation`, the `sender_id` of
+  `post_envelope`, the owner in `observe_task`.
+- **Channel-scoped** — a bound agent must be a participant: `get_channel`,
+  `close_channel`, `read_wal`, `find_envelope_by_causation`. `list_channels`
+  without an `agent_id` lists only those channels.
+- **Task-scoped** — when the hub has observed the task, its owner must be bound.
+
+An op in no class is rejected, so a new op is unreachable until it is
+classified. A `ReceiptFrame` for an agent not bound to the connection is dropped.
+Denials raise `AccessDeniedError`, returned as an `access_denied` response; the
+connection stays open.
+
+## Consequences
+
+- The trust boundary is the wire. An in-process `HubClient` with a hub reference,
+  and code holding the `Hub`, act as any agent — they already run inside the
+  hub's process.
+- A channel participant reads the whole WAL, including envelopes whose
+  `audience` excludes it: the client re-folds adapter state from the full WAL,
+  so filtering by audience would diverge it from the hub's fold.
+- Re-attaching an agent from a new connection moves its authority there; the old
+  connection's late requests and receipts for it are rejected or dropped.
+- Checkpoints for a task id the hub never observed have no owner and remain
+  open to any connection.

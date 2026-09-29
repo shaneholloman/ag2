@@ -34,7 +34,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ag2.knowledge import KnowledgeStore
 from ag2.task import TERMINAL_TASK_STATES, TaskMetadata, TaskState
@@ -197,6 +197,59 @@ def _expires_at(now_iso: str, ttl_seconds: int) -> str:
         return ""
     base = datetime.fromisoformat(now_iso)
     return (base + timedelta(seconds=ttl_seconds)).isoformat()
+
+
+# Authorization scope of every wire control-plane op, enforced by
+# ``Hub._authorize_request``. ``post_envelope``, ``observe_task`` and
+# ``list_channels`` carry their identity in a nested or optional param and
+# are checked there directly; any other op missing from these tables is
+# rejected, so a new op must be classified before it is reachable.
+
+# Ops open to any connection: admission and hub-wide discovery reads.
+_UNSCOPED_OPS: frozenset[str] = frozenset({
+    "register",
+    "get_agent",
+    "get_resume",
+    "get_skill",
+    "get_rule",
+    "find_agent_id",
+    "names_for",
+    "list_agents",
+    "get_task",
+    "list_tasks",
+})
+
+# Ops that act as, or read the private state of, the agent named by the
+# mapped param; that agent must be bound to the calling connection.
+_AGENT_SCOPED_OPS: dict[str, str] = {
+    "set_resume": "agent_id",
+    "set_skill": "agent_id",
+    "set_rule": "agent_id",
+    "unregister": "agent_id",
+    "create_channel": "creator_id",
+    "can_send": "sender_id",
+    "pending_turns_for": "agent_id",
+    "report_turn_failure": "agent_id",
+    "record_observation": "owner_id",
+}
+
+# Ops on ``params["channel_id"]``; an agent bound to the calling
+# connection must be one of the channel's participants.
+_CHANNEL_SCOPED_OPS: frozenset[str] = frozenset({
+    "get_channel",
+    "close_channel",
+    "read_wal",
+    "find_envelope_by_causation",
+})
+
+# Ops on ``params["task_id"]``; when the hub has observed the task, its
+# owner must be bound to the calling connection.
+_TASK_SCOPED_OPS: frozenset[str] = frozenset({
+    "update_task",
+    "fire_task_event",
+    "checkpoint_task",
+    "read_task_checkpoint",
+})
 
 
 class Hub:
@@ -2318,7 +2371,7 @@ class Hub:
             if frame.since_envelope_id is not None:
                 await self._replay_for_recipient(agent_id, frame.since_envelope_id)
         elif isinstance(frame, ReceiptFrame):
-            await self._handle_receipt(frame)
+            await self._handle_receipt(endpoint, frame)
         elif isinstance(frame, PingFrame):
             await endpoint.send_frame(PongFrame())
 
@@ -2365,8 +2418,12 @@ class Hub:
         Long but flat by design: one place to see the entire wire
         control surface. Each branch deserialises ``params`` into the
         hub method's arguments and serialises the return value back to
-        a JSON-compatible shape.
+        a JSON-compatible shape. :meth:`_authorize_request` runs first,
+        so every branch acts only within the calling connection's bound
+        identities.
         """
+        self._authorize_request(endpoint, op, params)
+
         # ── Registration / identity ──────────────────────────────────
         if op == "register":
             passport = Passport.from_dict(params["passport"])
@@ -2433,10 +2490,13 @@ class Hub:
         if op == "get_channel":
             return (await self.get_channel(params["channel_id"])).to_dict()
         if op == "list_channels":
-            channels = await self.list_channels(
-                agent_id=params.get("agent_id"),
-                limit=params.get("limit", 50),
-            )
+            if params.get("agent_id") is not None:
+                channels = await self.list_channels(agent_id=params["agent_id"], limit=params.get("limit", 50))
+            else:
+                # No agent named: list the channels of every agent bound here.
+                bound = self._endpoint_to_agents.get(endpoint.endpoint_id, set())
+                channels = [m for m in self._channels.values() if bound & set(m.participant_ids())]
+                channels = channels[: params.get("limit", 50)]
             return [m.to_dict() for m in channels]
         if op == "close_channel":
             metadata = await self.close_channel(params["channel_id"], reason=params.get("reason", ""))
@@ -2520,7 +2580,65 @@ class Hub:
 
         raise ProtocolError(f"unknown control-plane op: {op!r}")
 
-    async def _handle_receipt(self, frame: ReceiptFrame) -> None:
+    def _authorize_request(self, endpoint: LinkEndpoint, op: str, params: dict[str, Any]) -> None:
+        """Reject a control-plane request outside the connection's identities.
+
+        A connection acts only as the agents bound to it — by a
+        ``register`` op or an authenticated ``HelloFrame`` — and one
+        connection may hold several. Agent-scoped ops (and the sender of
+        a posted envelope, the owner of an observed task) must name a
+        bound agent; channel-scoped ops need a bound participant;
+        task-scoped ops need the observed task's owner to be bound.
+        Admission and discovery reads are open. Violations raise
+        :class:`AccessDeniedError`, which the caller returns as an
+        ``access_denied`` response.
+        """
+        if op in _UNSCOPED_OPS:
+            return
+        if op in _AGENT_SCOPED_OPS:
+            self._require_bound(endpoint, params[_AGENT_SCOPED_OPS[op]])
+            if op == "record_observation" and params.get("task_id") is not None:
+                self._require_task_owner(endpoint, params["task_id"])
+        elif op in _CHANNEL_SCOPED_OPS:
+            self._require_participant(endpoint, params["channel_id"])
+        elif op in _TASK_SCOPED_OPS:
+            self._require_task_owner(endpoint, params["task_id"])
+        elif op == "post_envelope":
+            self._require_bound(endpoint, params["envelope"]["sender_id"])
+        elif op == "observe_task":
+            self._require_bound(endpoint, params["metadata"]["owner_id"])
+            self._require_task_owner(endpoint, params["metadata"]["task_id"])
+        elif op == "list_channels":
+            if params.get("agent_id") is not None:
+                self._require_bound(endpoint, params["agent_id"])
+        else:
+            raise ProtocolError(f"unknown control-plane op: {op!r}")
+
+    def _require_bound(self, endpoint: LinkEndpoint, agent_id: str) -> None:
+        """Raise :class:`AccessDeniedError` unless ``agent_id`` is bound to ``endpoint``."""
+        if agent_id not in self._endpoint_to_agents.get(endpoint.endpoint_id, set()):
+            raise AccessDeniedError(f"connection is not bound to agent {agent_id!r}")
+
+    def _require_participant(self, endpoint: LinkEndpoint, channel_id: str) -> None:
+        """Raise unless an agent bound to ``endpoint`` participates in ``channel_id``."""
+        metadata = self._channels.get(channel_id)
+        if metadata is None:
+            raise NotFoundError(f"channel not found: {channel_id}")
+        bound = self._endpoint_to_agents.get(endpoint.endpoint_id, set())
+        if not bound & set(metadata.participant_ids()):
+            raise AccessDeniedError(f"connection has no participant in channel {channel_id!r}")
+
+    def _require_task_owner(self, endpoint: LinkEndpoint, task_id: str) -> None:
+        """Raise unless the owner of observed task ``task_id`` is bound to ``endpoint``.
+
+        A task the hub has not observed has no owner to protect, so it
+        passes — ``checkpoint_task`` accepts ids the hub never mirrored.
+        """
+        metadata = self._tasks.get(task_id)
+        if metadata is not None:
+            self._require_bound(endpoint, metadata.owner_id)
+
+    async def _handle_receipt(self, endpoint: LinkEndpoint, frame: ReceiptFrame) -> None:
         """Process a delivery receipt from a client.
 
         ``status="ack"`` advances the recipient's cursor for the acked
@@ -2531,13 +2649,16 @@ class Hub:
         operational visibility.
 
         Receipts whose ``recipient_id`` or ``channel_id`` is empty, or
-        whose ``recipient_id`` is unknown, are dropped silently: an
-        ack the hub cannot attribute to a (recipient, channel) cursor
-        has nothing to advance, and a stale receipt for an unregistered
-        agent has nothing to act on.
+        whose ``recipient_id`` is unknown or not bound to ``endpoint``,
+        are dropped silently: an ack the hub cannot attribute to a
+        (recipient, channel) cursor has nothing to advance, a stale
+        receipt for an unregistered agent has nothing to act on, and a
+        connection only acks deliveries for the agents it holds.
         """
         recipient_id = frame.recipient_id
         if not recipient_id or recipient_id not in self._passports:
+            return
+        if recipient_id not in self._endpoint_to_agents.get(endpoint.endpoint_id, set()):
             return
         if frame.status == "ack":
             if frame.envelope_id and frame.channel_id:
