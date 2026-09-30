@@ -52,6 +52,28 @@ existing identity is validated with the scheme that identity registered with; a
 Hello naming another scheme — e.g. `none` in a registry that also holds `NoAuth`
 — is refused with `auth_failed`.
 
+A `kind="remote_agent"` passport is different: its `auth.scheme` is a routing
+label for a `RemoteAgentProxy`, not a credential, so registration never
+validates it. The federation operator normally registers such identities on
+the hub directly (`Hub.register_identity`) and its proxy posts for them
+in-process; they have no connection of their own. Over the wire, therefore:
+
+- registering a `remote_agent` needs a connection that already holds a
+  non-remote agent of this hub. Those agents become its **owners**, persisted
+  at `agents/{id}/owners.json` and reloaded on `hydrate`;
+- a Hello for a `remote_agent` is accepted only on a connection holding one of
+  its owners, and never on the strength of a scheme. One registered in-process
+  has no owners and cannot be re-attached over the wire at all.
+
+Without this, a connection with no credential could register a `remote_agent`
+under an unused name, capturing traffic meant for it, or re-attach as one with
+`auth_scheme="none"` wherever the registry holds `NoAuth`.
+
+Every task id a wire request names (`task_id`, `metadata.task_id`,
+`envelope.task_id`) must be one path segment — `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`,
+which covers `uuid4().hex` and ids like `task-1` — because task ids become
+store paths. Anything else is a `ProtocolError`.
+
 Independently of the connection, `post_envelope` accepts events only from the
 channel's participants, in the hub rather than per adapter, so an adapter that
 forgets the check cannot let outsiders inject content. This covers protocol
@@ -61,7 +83,7 @@ and invitees are participants from creation. The one exception is
 `ag2.task.cancel_request` shaped as the `tasks` tool sends it, which any peer
 may post: its `task_id` names a live task the hub has observed in that same,
 active channel, its audience is exactly `[task owner]`, and its `event_data` is
-exactly `{"task_id", "reason"}`. For that to mean anything, a task's channel
+exactly `{"task_id", "reason"}` with a string `reason`. For that to mean anything, a task's channel
 must be trustworthy, so `observe_task` over the wire requires the owner to be a
 participant of the task's `channel_id`.
 

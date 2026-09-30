@@ -376,6 +376,20 @@ class TestChannelScope:
                 await bob_hc.close()
                 await mallory_hc.close()
 
+    @pytest.mark.asyncio
+    async def test_task_id_that_is_not_a_single_path_segment_is_refused(self) -> None:
+        async with _serve() as (hub, url):
+            bob_hc = HubClient(WsLink(url))
+            try:
+                await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
+
+                with pytest.raises(ProtocolError, match="invalid task_id"):
+                    await bob_hc.checkpoint_task("../agents/x", {"step": 1})
+
+                assert await hub._store.read("/agents/x/checkpoint.json") is None
+            finally:
+                await bob_hc.close()
+
 
 class TestPeerCancelRequest:
     @pytest.mark.asyncio
@@ -417,26 +431,43 @@ class TestPeerCancelRequest:
                 await carol_hc.close()
 
     @pytest.mark.asyncio
-    async def test_outsider_cancel_request_not_for_a_live_task_of_the_channel_is_refused(self) -> None:
+    async def test_outsider_cancel_request_not_shaped_as_the_tasks_tool_sends_it_is_refused(self) -> None:
         async with _serve() as (hub, url):
             alice_hc, bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url)), HubClient(WsLink(url))
             try:
                 alice = await alice_hc.register(_agent("alice"), _passport("alice"), Resume())
-                await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
+                bob = await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
                 mallory = await mallory_hc.register(_agent("mallory"), _passport("mallory"), Resume())
                 channel = await alice.open(type="conversation", target="bob")
-
-                with pytest.raises(ProtocolError, match="only accepts sends from participants"):
-                    await mallory_hc.post_envelope(
-                        Envelope(
-                            channel_id=channel.channel_id,
-                            sender_id=mallory.agent_id,
-                            audience=None,
-                            event_type=EV_TASK_CANCEL_REQUEST,
-                            event_data={"text": "injected"},
-                            task_id="nope",
-                        )
+                await bob_hc.observe_task(
+                    TaskMetadata(
+                        task_id="t-bob",
+                        owner_id=bob.agent_id,
+                        spec=TaskSpec(title="t"),
+                        state=TaskState.RUNNING,
+                        channel_id=channel.channel_id,
                     )
+                )
+
+                unconstrained = Envelope(
+                    channel_id=channel.channel_id,
+                    sender_id=mallory.agent_id,
+                    audience=None,
+                    event_type=EV_TASK_CANCEL_REQUEST,
+                    event_data={"text": "injected"},
+                    task_id="nope",
+                )
+                non_text_reason = Envelope(
+                    channel_id=channel.channel_id,
+                    sender_id=mallory.agent_id,
+                    audience=[bob.agent_id],
+                    event_type=EV_TASK_CANCEL_REQUEST,
+                    event_data={"task_id": "t-bob", "reason": {"text": "injected"}},
+                    task_id="t-bob",
+                )
+                for envelope in (unconstrained, non_text_reason):
+                    with pytest.raises(ProtocolError, match="only accepts sends from participants"):
+                        await mallory_hc.post_envelope(envelope)
 
                 wal = await hub.read_wal(channel.channel_id)
                 assert not any(e.sender_id == mallory.agent_id for e in wal)
@@ -481,3 +512,64 @@ class TestReattach:
             finally:
                 await bob_hc.close()
                 await mallory_link.close()
+
+
+class TestRemoteAgent:
+    @pytest.mark.asyncio
+    async def test_connection_without_an_agent_cannot_register_a_remote_agent(self) -> None:
+        async with _serve(allow_no_auth=True) as (hub, url):
+            keyless_hc = HubClient(WsLink(url))
+            try:
+                with pytest.raises(AccessDeniedError):
+                    await keyless_hc.register(
+                        _agent("partner"), Passport(name="partner", kind="remote_agent"), Resume(), attach_plugin=False
+                    )
+
+                assert hub.find_agent_id("partner") is None
+            finally:
+                await keyless_hc.close()
+
+    @pytest.mark.asyncio
+    async def test_hello_as_a_remote_agent_without_its_owner_is_refused(self) -> None:
+        async with _serve(allow_no_auth=True) as (_, url):
+            owner_hc = HubClient(WsLink(url))
+            keyless_link = WsLinkClient(url)
+            try:
+                await owner_hc.register(_agent("alice"), _passport("alice"), Resume())
+                await owner_hc.register(
+                    _agent("partner"), Passport(name="partner", kind="remote_agent"), Resume(), attach_plugin=False
+                )
+                await keyless_link.open()
+
+                await keyless_link.send_frame(HelloFrame(name="partner", auth_scheme="none", auth_claim={}))
+                reply = await asyncio.wait_for(anext(aiter(keyless_link.frames())), 2.0)
+
+                assert isinstance(reply, ErrorFrame)
+                assert reply.code == "auth_failed"
+            finally:
+                await owner_hc.close()
+                await keyless_link.close()
+
+    @pytest.mark.asyncio
+    async def test_owner_reattaches_its_remote_agent_on_a_new_connection(self) -> None:
+        async with _serve(allow_no_auth=True) as (hub, url):
+            first_hc, second_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
+            try:
+                await first_hc.register(_agent("alice"), _passport("alice"), Resume())
+                partner = await first_hc.register(
+                    _agent("partner"),
+                    Passport(name="partner", kind="remote_agent", auth=AuthBlock(scheme="a2a")),
+                    Resume(),
+                    attach_plugin=False,
+                )
+                await first_hc.close()
+                await hub.hydrate()  # ownership is read back from the store
+
+                await second_hc.attach(_agent("alice"), name="alice", passport=_passport("alice"))
+                await second_hc.attach(_agent("partner"), name="partner", attach_plugin=False)
+                await second_hc.set_skill(partner.agent_id, "federated peer")
+
+                assert await hub.get_skill(partner.agent_id) == "federated peer"
+            finally:
+                await first_hc.close()
+                await second_hc.close()

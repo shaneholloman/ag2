@@ -32,6 +32,7 @@ import dataclasses
 import fnmatch
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
@@ -106,6 +107,7 @@ from .layout import (
     channels_root,
     inbox_cursor_path,
     passport_path,
+    remote_owners_path,
     resume_path,
     rule_path,
     skill_path,
@@ -193,6 +195,15 @@ def _is_protocol_event(event_type: str) -> bool:
     return _is_channel_protocol_event(event_type) or _is_task_event(event_type)
 
 
+def _wire_task_ids(params: dict[str, Any]) -> list[object]:
+    """Task ids a wire request names: top-level, in task metadata, or on an envelope."""
+    ids = [params.get("task_id")]
+    for nested in ("metadata", "envelope"):
+        if isinstance(params.get(nested), dict):
+            ids.append(params[nested].get("task_id"))
+    return [task_id for task_id in ids if task_id is not None]
+
+
 def _expires_at(now_iso: str, ttl_seconds: int) -> str:
     """Compute ``expires_at`` ISO timestamp from a base + duration."""
     if ttl_seconds <= 0:
@@ -202,14 +213,20 @@ def _expires_at(now_iso: str, ttl_seconds: int) -> str:
 
 
 # Authorization scope of every wire control-plane op, enforced by
-# ``Hub._authorize_request``. ``post_envelope``, ``observe_task`` and
-# ``list_channels`` carry their identity in a nested or optional param and
-# are checked there directly; any other op missing from these tables is
+# ``Hub._authorize_request``. ``register``, ``post_envelope``,
+# ``observe_task`` and ``list_channels`` carry their identity in a nested
+# or optional param and are checked there directly; any other op missing from these tables is
 # rejected, so a new op must be classified before it is reachable.
 
-# Ops open to any connection: admission and hub-wide discovery reads.
+# Task ids a wire client may name. They become store path segments, so
+# separators and dot-only names are excluded; ``uuid4().hex`` and
+# human-readable ids like ``task-1`` fit.
+_TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+# Ops open to any connection: hub-wide discovery reads. ``register`` is
+# open too, except that a ``remote_agent`` needs an owner (see
+# ``Hub._authorize_request``).
 _UNSCOPED_OPS: frozenset[str] = frozenset({
-    "register",
     "get_agent",
     "get_resume",
     "get_skill",
@@ -315,6 +332,8 @@ class Hub:
         self._rules: dict[str, Rule] = {}
         self._skills: dict[str, str] = {}
         self._name_to_id: dict[str, str] = {}
+        # remote_agent id → agents that own it (registered over the wire).
+        self._remote_owners: dict[str, list[str]] = {}
         # capability name → set of agent_ids that claim or have observed it.
         # Persisted as registry/by_capability.json on every mutation
         # (rebuilt from resumes on hydrate — the file is a derived cache).
@@ -483,6 +502,7 @@ class Hub:
         self._rules.clear()
         self._skills.clear()
         self._name_to_id.clear()
+        self._remote_owners.clear()
         self._capability_index.clear()
         self._channels.clear()
         self._active_channels.clear()
@@ -1148,6 +1168,7 @@ class Hub:
             self._resumes.pop(agent_id, None)
             self._rules.pop(agent_id, None)
             self._skills.pop(agent_id, None)
+            self._remote_owners.pop(agent_id, None)
             if passport is not None and self._name_to_id.get(passport.name) == agent_id:
                 self._name_to_id.pop(passport.name, None)
 
@@ -1178,6 +1199,7 @@ class Hub:
             await self._store.delete(resume_path(agent_id))
             await self._store.delete(rule_path(agent_id))
             await self._store.delete(skill_path(agent_id))
+            await self._store.delete(remote_owners_path(agent_id))
 
             # Drop inbox accounting so a future re-register with a
             # different agent_id starts from zero.
@@ -2105,7 +2127,8 @@ class Hub:
         That is: an ``EV_TASK_CANCEL_REQUEST`` on an active channel, for a
         live task the hub has observed in that same channel, addressed
         only to the task's owner, whose ``event_data`` is exactly
-        ``{"task_id", "reason"}`` naming the envelope's task.
+        ``{"task_id", "reason"}`` naming the envelope's task with a
+        string ``reason``.
         """
         if envelope.event_type != EV_TASK_CANCEL_REQUEST or envelope.task_id is None:
             return False
@@ -2118,6 +2141,7 @@ class Hub:
             and envelope.audience == [task.owner_id]
             and set(envelope.event_data) == {"task_id", "reason"}
             and envelope.event_data["task_id"] == envelope.task_id
+            and isinstance(envelope.event_data["reason"], str)
         )
 
     # ── Endpoint management ─────────────────────────────────────────────────
@@ -2391,15 +2415,22 @@ class Hub:
                 await endpoint.send_frame(ErrorFrame(code="not_found", message=f"no passport for {frame.name}"))
                 return
             try:
-                # The identity's registered scheme decides how it re-attaches;
-                # a Hello naming any other scheme is refused.
-                if frame.auth_scheme != passport.auth.scheme:
+                # A remote_agent's scheme is a routing label, not a credential:
+                # it re-attaches only on a connection holding one of its owners.
+                # Any other identity re-attaches with its registered scheme;
+                # a Hello naming another scheme is refused.
+                if passport.effective_kind == "remote_agent":
+                    bound = self._endpoint_to_agents.get(endpoint.endpoint_id, set())
+                    if not bound & set(self._remote_owners.get(agent_id, [])):
+                        raise AuthError(f"remote agent {frame.name!r} re-attaches only alongside its owner")
+                elif frame.auth_scheme != passport.auth.scheme:
                     raise AuthError(
                         f"auth scheme {frame.auth_scheme!r} does not match {frame.name!r}'s "
                         f"registered scheme {passport.auth.scheme!r}"
                     )
-                adapter = self._auth.get(passport.auth.scheme)
-                await adapter.validate(passport, frame.auth_claim)
+                else:
+                    adapter = self._auth.get(passport.auth.scheme)
+                    await adapter.validate(passport, frame.auth_claim)
             except AuthError as exc:
                 await endpoint.send_frame(ErrorFrame(code="auth_failed", message=str(exc)))
                 return
@@ -2470,12 +2501,17 @@ class Hub:
             passport = Passport.from_dict(params["passport"])
             resume = Resume.from_dict(params["resume"])
             rule = Rule.from_dict(params["rule"]) if params.get("rule") is not None else None
+            owners = self._remote_owner_candidates(endpoint) if passport.effective_kind == "remote_agent" else []
             registered = await self.register_identity(
                 passport,
                 resume,
                 skill_md=params.get("skill_md"),
                 rule=rule,
             )
+            if owners:
+                assert registered.agent_id is not None
+                await self._store.write(remote_owners_path(registered.agent_id), json.dumps(owners))
+                self._remote_owners[registered.agent_id] = owners
             # Bind the calling connection to the freshly-stamped identity
             # so dispatched notifies route back to this endpoint.
             self.bind_endpoint(endpoint.endpoint_id, registered.agent_id)
@@ -2632,13 +2668,22 @@ class Hub:
         task-scoped ops need the observed task's owner to be bound, and a
         checkpoint of an unobserved task needs one of its first writer's
         agents, as does observing that task. Observing a task onto a
-        channel needs its owner to participate there. Admission and
-        discovery reads are open. Violations raise :class:`AccessDeniedError`, which the
+        channel needs its owner to participate there. Discovery reads and
+        ``register`` are open, but registering a ``remote_agent`` needs a
+        non-remote agent bound here, which becomes its owner. Every task
+        id named must match ``_TASK_ID_RE`` (``ProtocolError`` otherwise).
+        Other violations raise :class:`AccessDeniedError`, which the
         caller returns as an ``access_denied`` response.
         """
+        for task_id in _wire_task_ids(params):
+            if not isinstance(task_id, str) or not _TASK_ID_RE.fullmatch(task_id):
+                raise ProtocolError(f"invalid task_id: {task_id!r}")
         if op in _UNSCOPED_OPS:
             return
-        if op in _AGENT_SCOPED_OPS:
+        if op == "register":
+            if params["passport"].get("kind") == "remote_agent" and not self._remote_owner_candidates(endpoint):
+                raise AccessDeniedError("registering a remote_agent needs a connection holding an agent of this hub")
+        elif op in _AGENT_SCOPED_OPS:
             self._require_bound(endpoint, params[_AGENT_SCOPED_OPS[op]])
             if op == "record_observation" and params.get("task_id") is not None:
                 self._require_task_owner(endpoint, params["task_id"])
@@ -2671,6 +2716,12 @@ class Hub:
                 self._require_bound(endpoint, params["agent_id"])
         else:
             raise ProtocolError(f"unknown control-plane op: {op!r}")
+
+    def _remote_owner_candidates(self, endpoint: LinkEndpoint) -> list[str]:
+        """Non-remote agents bound to ``endpoint``, sorted — the owners a
+        ``remote_agent`` registered on it gets."""
+        bound = self._endpoint_to_agents.get(endpoint.endpoint_id, set())
+        return sorted(a for a in bound if a in self._passports and self._passports[a].effective_kind != "remote_agent")
 
     def _require_bound(self, endpoint: LinkEndpoint, agent_id: str) -> None:
         """Raise :class:`AccessDeniedError` unless ``agent_id`` is bound to ``endpoint``."""
@@ -3066,6 +3117,10 @@ class Hub:
             self._rules[agent_id] = Rule.from_dict(json.loads(rule_data))
         else:
             self._rules[agent_id] = Rule()
+
+        owners_data = await self._store.read(remote_owners_path(agent_id))
+        if owners_data is not None:
+            self._remote_owners[agent_id] = list(json.loads(owners_data))
 
         cursor_blob = await self._store.read(inbox_cursor_path(agent_id))
         if cursor_blob:
