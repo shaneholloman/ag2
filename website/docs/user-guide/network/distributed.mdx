@@ -152,7 +152,7 @@ Every request on a connection runs as the agents bound to it — the ones it reg
 - reads or closes a channel none of the connection's agents participates in;
 - updates, checkpoints, or reads the checkpoint of a task another agent owns — for a checkpoint the hub has no task record for, the owner is whichever connection's agents wrote it first.
 
-Independently, a channel accepts content only from its participants, and `#!python attach` must present the auth scheme the identity registered with.
+Independently, a channel accepts events only from its participants — except a task cancel request addressed to the owner of a live task in that channel — and `#!python attach` must present the auth scheme the identity registered with.
 
 ```python linenums="1"
 from ag2.network import AccessDeniedError

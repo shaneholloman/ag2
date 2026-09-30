@@ -22,6 +22,7 @@ from ag2.network import (
     EV_CHANNEL_CLOSED,
     EV_CHANNEL_INVITE,
     EV_CHANNEL_INVITE_REJECT,
+    EV_TASK_CANCEL_REQUEST,
     EV_TEXT,
     AccessDeniedError,
     ApiKeyAuth,
@@ -348,6 +349,100 @@ class TestChannelScope:
                     opening.cancel()
                     await asyncio.gather(opening, return_exceptions=True)
                 await alice_hc.close()
+                await mallory_hc.close()
+
+    @pytest.mark.asyncio
+    async def test_observing_a_task_onto_a_foreign_channel_is_denied(self) -> None:
+        async with _serve() as (_, url):
+            alice_hc, bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url)), HubClient(WsLink(url))
+            try:
+                alice = await alice_hc.register(_agent("alice"), _passport("alice"), Resume())
+                await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
+                mallory = await mallory_hc.register(_agent("mallory"), _passport("mallory"), Resume())
+                channel = await alice.open(type="conversation", target="bob")
+
+                with pytest.raises(AccessDeniedError):
+                    await mallory_hc.observe_task(
+                        TaskMetadata(
+                            task_id="t-mallory",
+                            owner_id=mallory.agent_id,
+                            spec=TaskSpec(title="t"),
+                            state=TaskState.RUNNING,
+                            channel_id=channel.channel_id,
+                        )
+                    )
+            finally:
+                await alice_hc.close()
+                await bob_hc.close()
+                await mallory_hc.close()
+
+
+class TestPeerCancelRequest:
+    @pytest.mark.asyncio
+    async def test_outsider_cancel_request_for_the_owners_task_is_accepted(self) -> None:
+        async with _serve() as (hub, url):
+            alice_hc, bob_hc, carol_hc = HubClient(WsLink(url)), HubClient(WsLink(url)), HubClient(WsLink(url))
+            try:
+                alice = await alice_hc.register(_agent("alice"), _passport("alice"), Resume())
+                bob = await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
+                carol = await carol_hc.register(_agent("carol"), _passport("carol"), Resume())
+                channel = await alice.open(type="conversation", target="bob")
+                await bob_hc.observe_task(
+                    TaskMetadata(
+                        task_id="t-bob",
+                        owner_id=bob.agent_id,
+                        spec=TaskSpec(title="t"),
+                        state=TaskState.RUNNING,
+                        channel_id=channel.channel_id,
+                    )
+                )
+
+                # Shaped exactly as ``tasks(action="cancel")`` sends it.
+                await carol_hc.post_envelope(
+                    Envelope(
+                        channel_id=channel.channel_id,
+                        sender_id=carol.agent_id,
+                        audience=[bob.agent_id],
+                        event_type=EV_TASK_CANCEL_REQUEST,
+                        event_data={"task_id": "t-bob", "reason": "wrap up"},
+                        task_id="t-bob",
+                    )
+                )
+
+                wal = await hub.read_wal(channel.channel_id)
+                assert [e.sender_id for e in wal if e.event_type == EV_TASK_CANCEL_REQUEST] == [carol.agent_id]
+            finally:
+                await alice_hc.close()
+                await bob_hc.close()
+                await carol_hc.close()
+
+    @pytest.mark.asyncio
+    async def test_outsider_cancel_request_not_for_a_live_task_of_the_channel_is_refused(self) -> None:
+        async with _serve() as (hub, url):
+            alice_hc, bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url)), HubClient(WsLink(url))
+            try:
+                alice = await alice_hc.register(_agent("alice"), _passport("alice"), Resume())
+                await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
+                mallory = await mallory_hc.register(_agent("mallory"), _passport("mallory"), Resume())
+                channel = await alice.open(type="conversation", target="bob")
+
+                with pytest.raises(ProtocolError, match="only accepts sends from participants"):
+                    await mallory_hc.post_envelope(
+                        Envelope(
+                            channel_id=channel.channel_id,
+                            sender_id=mallory.agent_id,
+                            audience=None,
+                            event_type=EV_TASK_CANCEL_REQUEST,
+                            event_data={"text": "injected"},
+                            task_id="nope",
+                        )
+                    )
+
+                wal = await hub.read_wal(channel.channel_id)
+                assert not any(e.sender_id == mallory.agent_id for e in wal)
+            finally:
+                await alice_hc.close()
+                await bob_hc.close()
                 await mallory_hc.close()
 
 

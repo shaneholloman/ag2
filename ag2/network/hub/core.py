@@ -1968,8 +1968,10 @@ class Hub:
         # Every event comes only from participants, whatever the adapter
         # accepts — hub-generated protocol envelopes carry the creator and
         # invitees are participants from creation. The one exception is a
-        # task cancel request, which a peer posts into the owner's channel.
-        if envelope.event_type != EV_TASK_CANCEL_REQUEST and envelope.sender_id not in metadata.participant_ids():
+        # well-formed task cancel request, which any peer may send.
+        if envelope.sender_id not in metadata.participant_ids() and not self._is_peer_cancel_request(
+            envelope, metadata
+        ):
             raise ProtocolError(
                 f"channel {envelope.channel_id!r} only accepts sends from participants, got {envelope.sender_id!r}"
             )
@@ -2096,6 +2098,27 @@ class Hub:
             )
 
         return envelope.envelope_id
+
+    def _is_peer_cancel_request(self, envelope: Envelope, metadata: ChannelMetadata) -> bool:
+        """True for a cancel request shaped as the ``tasks`` tool sends it.
+
+        That is: an ``EV_TASK_CANCEL_REQUEST`` on an active channel, for a
+        live task the hub has observed in that same channel, addressed
+        only to the task's owner, whose ``event_data`` is exactly
+        ``{"task_id", "reason"}`` naming the envelope's task.
+        """
+        if envelope.event_type != EV_TASK_CANCEL_REQUEST or envelope.task_id is None:
+            return False
+        task = self._tasks.get(envelope.task_id)
+        return (
+            task is not None
+            and task.state not in TERMINAL_TASK_STATES
+            and metadata.state == ChannelState.ACTIVE
+            and task.channel_id == envelope.channel_id
+            and envelope.audience == [task.owner_id]
+            and set(envelope.event_data) == {"task_id", "reason"}
+            and envelope.event_data["task_id"] == envelope.task_id
+        )
 
     # ── Endpoint management ─────────────────────────────────────────────────
 
@@ -2608,8 +2631,9 @@ class Hub:
         bound agent; channel-scoped ops need a bound participant;
         task-scoped ops need the observed task's owner to be bound, and a
         checkpoint of an unobserved task needs one of its first writer's
-        agents, as does observing that task. Admission and discovery reads
-        are open. Violations raise :class:`AccessDeniedError`, which the
+        agents, as does observing that task. Observing a task onto a
+        channel needs its owner to participate there. Admission and
+        discovery reads are open. Violations raise :class:`AccessDeniedError`, which the
         caller returns as an ``access_denied`` response.
         """
         if op in _UNSCOPED_OPS:
@@ -2629,6 +2653,13 @@ class Hub:
             self._require_bound(endpoint, params["envelope"]["sender_id"])
         elif op == "observe_task":
             self._require_bound(endpoint, params["metadata"]["owner_id"])
+            if params["metadata"].get("channel_id"):
+                # A task joins a channel only through a participant owner.
+                channel = self._channels.get(params["metadata"]["channel_id"])
+                if channel is None or params["metadata"]["owner_id"] not in channel.participant_ids():
+                    raise AccessDeniedError(
+                        f"task owner is not a participant of channel {params['metadata']['channel_id']!r}"
+                    )
             if params["metadata"]["task_id"] in self._tasks:
                 self._require_task_owner(endpoint, params["metadata"]["task_id"])
             else:

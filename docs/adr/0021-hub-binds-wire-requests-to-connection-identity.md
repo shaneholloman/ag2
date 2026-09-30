@@ -58,7 +58,12 @@ forgets the check cannot let outsiders inject content. This covers protocol
 events too — an outsider's `ag2.channel.invite.reject` would otherwise fail
 another agent's handshake. Hub-generated protocol envelopes carry the creator,
 and invitees are participants from creation. The one exception is
-`ag2.task.cancel_request`, which a peer posts into the task owner's channel.
+`ag2.task.cancel_request` shaped as the `tasks` tool sends it, which any peer
+may post: its `task_id` names a live task the hub has observed in that same,
+active channel, its audience is exactly `[task owner]`, and its `event_data` is
+exactly `{"task_id", "reason"}`. For that to mean anything, a task's channel
+must be trustworthy, so `observe_task` over the wire requires the owner to be a
+participant of the task's `channel_id`.
 
 ## Consequences
 
