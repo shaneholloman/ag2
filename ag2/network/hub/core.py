@@ -109,6 +109,7 @@ from .layout import (
     rule_path,
     skill_path,
     task_checkpoint_path,
+    task_checkpoint_writers_path,
     task_metadata_path,
     tasks_root,
     wal_path,
@@ -243,7 +244,8 @@ _CHANNEL_SCOPED_OPS: frozenset[str] = frozenset({
 })
 
 # Ops on ``params["task_id"]``; when the hub has observed the task, its
-# owner must be bound to the calling connection.
+# owner must be bound to the calling connection. A checkpoint of a task
+# the hub has not observed belongs to the agents of its first writer.
 _TASK_SCOPED_OPS: frozenset[str] = frozenset({
     "update_task",
     "fire_task_event",
@@ -1962,6 +1964,13 @@ class Hub:
             raise ProtocolError(f"channel {envelope.channel_id!r} is {metadata.state.value}")
         if not _is_protocol_event(envelope.event_type) and metadata.state != ChannelState.ACTIVE:
             raise ProtocolError(f"channel {envelope.channel_id!r} not active (state={metadata.state.value})")
+        # Substantive content comes only from participants, whatever the
+        # adapter accepts. Protocol events keep their own rules (a peer
+        # may post a task cancel request into the owner's channel).
+        if not _is_protocol_event(envelope.event_type) and envelope.sender_id not in metadata.participant_ids():
+            raise ProtocolError(
+                f"channel {envelope.channel_id!r} only accepts sends from participants, got {envelope.sender_id!r}"
+            )
 
         # Adapter must be registered to dispatch on this channel.
         # Distinct from create_channel's NotFoundError (where the user
@@ -2357,7 +2366,14 @@ class Hub:
                 await endpoint.send_frame(ErrorFrame(code="not_found", message=f"no passport for {frame.name}"))
                 return
             try:
-                adapter = self._auth.get(frame.auth_scheme)
+                # The identity's registered scheme decides how it re-attaches;
+                # a Hello naming any other scheme is refused.
+                if frame.auth_scheme != passport.auth.scheme:
+                    raise AuthError(
+                        f"auth scheme {frame.auth_scheme!r} does not match {frame.name!r}'s "
+                        f"registered scheme {passport.auth.scheme!r}"
+                    )
+                adapter = self._auth.get(passport.auth.scheme)
                 await adapter.validate(passport, frame.auth_claim)
             except AuthError as exc:
                 await endpoint.send_frame(ErrorFrame(code="auth_failed", message=str(exc)))
@@ -2422,7 +2438,7 @@ class Hub:
         so every branch acts only within the calling connection's bound
         identities.
         """
-        self._authorize_request(endpoint, op, params)
+        await self._authorize_request(endpoint, op, params)
 
         # ── Registration / identity ──────────────────────────────────
         if op == "register":
@@ -2580,7 +2596,7 @@ class Hub:
 
         raise ProtocolError(f"unknown control-plane op: {op!r}")
 
-    def _authorize_request(self, endpoint: LinkEndpoint, op: str, params: dict[str, Any]) -> None:
+    async def _authorize_request(self, endpoint: LinkEndpoint, op: str, params: dict[str, Any]) -> None:
         """Reject a control-plane request outside the connection's identities.
 
         A connection acts only as the agents bound to it — by a
@@ -2588,8 +2604,9 @@ class Hub:
         connection may hold several. Agent-scoped ops (and the sender of
         a posted envelope, the owner of an observed task) must name a
         bound agent; channel-scoped ops need a bound participant;
-        task-scoped ops need the observed task's owner to be bound.
-        Admission and discovery reads are open. Violations raise
+        task-scoped ops need the observed task's owner to be bound, and a
+        checkpoint of an unobserved task needs one of its first writer's
+        agents. Admission and discovery reads are open. Violations raise
         :class:`AccessDeniedError`, which the caller returns as an
         ``access_denied`` response.
         """
@@ -2602,7 +2619,10 @@ class Hub:
         elif op in _CHANNEL_SCOPED_OPS:
             self._require_participant(endpoint, params["channel_id"])
         elif op in _TASK_SCOPED_OPS:
-            self._require_task_owner(endpoint, params["task_id"])
+            if params["task_id"] in self._tasks:
+                self._require_task_owner(endpoint, params["task_id"])
+            elif op in ("checkpoint_task", "read_task_checkpoint"):
+                await self._require_checkpoint_writer(endpoint, params["task_id"], claim=op == "checkpoint_task")
         elif op == "post_envelope":
             self._require_bound(endpoint, params["envelope"]["sender_id"])
         elif op == "observe_task":
@@ -2628,11 +2648,31 @@ class Hub:
         if not bound & set(metadata.participant_ids()):
             raise AccessDeniedError(f"connection has no participant in channel {channel_id!r}")
 
+    async def _require_checkpoint_writer(self, endpoint: LinkEndpoint, task_id: str, *, claim: bool) -> None:
+        """Raise unless ``endpoint`` holds a writer of unobserved task ``task_id``'s checkpoint.
+
+        The first ``checkpoint_task`` for the id records the agents bound
+        to the writing connection (``claim=True``); later reads and writes
+        need one of them bound. An id with no recorded writers reads as
+        open — it has no checkpoint written over the wire to protect.
+        """
+        bound = self._endpoint_to_agents.get(endpoint.endpoint_id, set())
+        if not bound:
+            raise AccessDeniedError("connection has no bound agent")
+        raw = await self._store.read(task_checkpoint_writers_path(task_id))
+        if raw is None:
+            if claim:
+                await self._store.write(task_checkpoint_writers_path(task_id), json.dumps(sorted(bound)))
+            return
+        if not bound & set(json.loads(raw)):
+            raise AccessDeniedError(f"connection holds no writer of task {task_id!r}'s checkpoint")
+
     def _require_task_owner(self, endpoint: LinkEndpoint, task_id: str) -> None:
         """Raise unless the owner of observed task ``task_id`` is bound to ``endpoint``.
 
-        A task the hub has not observed has no owner to protect, so it
-        passes — ``checkpoint_task`` accepts ids the hub never mirrored.
+        A task the hub has not observed has no owner, so it passes;
+        checkpoints of such ids are guarded by
+        :meth:`_require_checkpoint_writer` instead.
         """
         metadata = self._tasks.get(task_id)
         if metadata is not None:

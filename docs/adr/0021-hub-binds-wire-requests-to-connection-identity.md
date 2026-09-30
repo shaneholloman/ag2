@@ -37,11 +37,25 @@ their signatures and stay unchecked.
   `close_channel`, `read_wal`, `find_envelope_by_causation`. `list_channels`
   without an `agent_id` lists only those channels.
 - **Task-scoped** — when the hub has observed the task, its owner must be bound.
+  A checkpoint of a task the hub has not observed belongs to the agents bound to
+  the connection that first wrote it (recorded next to the checkpoint); later
+  reads and writes need one of them.
 
 An op in no class is rejected, so a new op is unreachable until it is
 classified. A `ReceiptFrame` for an agent not bound to the connection is dropped.
 Denials raise `AccessDeniedError`, returned as an `access_denied` response; the
 connection stays open.
+
+The binding is only as strong as admission, so a `HelloFrame` re-attaching an
+existing identity is validated with the scheme that identity registered with; a
+Hello naming another scheme — e.g. `none` in a registry that also holds `NoAuth`
+— is refused with `auth_failed`.
+
+Independently of the connection, `post_envelope` accepts non-protocol events
+only from the channel's participants, in the hub rather than per adapter, so an
+adapter that forgets the check cannot let outsiders inject content. Protocol
+events keep their own rules: a peer may post a task cancel request into the
+owner's channel.
 
 ## Consequences
 
@@ -53,5 +67,11 @@ connection stays open.
   so filtering by audience would diverge it from the hub's fold.
 - Re-attaching an agent from a new connection moves its authority there; the old
   connection's late requests and receipts for it are rejected or dropped.
-- Checkpoints for a task id the hub never observed have no owner and remain
-  open to any connection.
+- Task records are hub-wide reads: any admitted connection sees every task's
+  spec, state, progress and result through `get_task` / `list_tasks`. This is
+  intended — delegators poll and wait on tasks other agents own, and the tasks
+  tool's `scope="all"` lists across owners — so agents must not put anything in
+  a task spec or result that other agents on the hub may not read.
+- A checkpoint written only in-process (or before writers were recorded) has no
+  recorded writer and stays readable by any connection until its first write
+  over the wire.

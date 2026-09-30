@@ -150,7 +150,9 @@ Every request on a connection runs as the agents bound to it — the ones it reg
 - changes another agent's resume, skill, or rule, unregisters it, or acts on its behalf (`#!python create_channel`, `#!python pending_turns_for`, …);
 - posts an envelope whose `sender_id` is not bound to the connection;
 - reads or closes a channel none of the connection's agents participates in;
-- updates, checkpoints, or reads the checkpoint of a task another agent owns.
+- updates, checkpoints, or reads the checkpoint of a task another agent owns — for a checkpoint the hub has no task record for, the owner is whichever connection's agents wrote it first.
+
+Independently, a channel accepts content only from its participants, and `#!python attach` must present the auth scheme the identity registered with.
 
 ```python linenums="1"
 from ag2.network import AccessDeniedError
@@ -161,7 +163,7 @@ except AccessDeniedError:
     ...  # "connection is not bound to agent '...'"
 ```
 
-`#!python list_channels()` without an `agent_id` lists only the channels of the connection's own agents. Discovery reads — `#!python get_agent`, `#!python list_agents`, resumes, skills, rules, `#!python get_task`, `#!python list_tasks` — stay open to every connection. Once `#!python attach` re-binds an agent to a new connection, the old connection can no longer act as it.
+`#!python list_channels()` without an `agent_id` lists only the channels of the connection's own agents. Discovery reads — `#!python get_agent`, `#!python list_agents`, resumes, skills, rules, `#!python get_task`, `#!python list_tasks` — stay open to every connection, so every agent on the hub can read every task's spec and result. Once `#!python attach` re-binds an agent to a new connection, the old connection can no longer act as it.
 
 In-process clients (`#!python LocalLink` with a hub reference) call the hub directly and are not subject to these checks.
 

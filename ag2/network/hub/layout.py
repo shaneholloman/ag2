@@ -29,6 +29,7 @@ __all__ = (
     "skill_path",
     "spans_path",
     "task_checkpoint_path",
+    "task_checkpoint_writers_path",
     "task_events_path",
     "task_metadata_path",
     "tasks_root",
@@ -133,6 +134,12 @@ def task_checkpoint_path(task_id: str) -> str:
     """Owner-supplied resume state for crash recovery. Single JSON
     blob, last-write-wins. Opaque to the framework."""
     return f"/tasks/{task_id}/checkpoint.json"
+
+
+def task_checkpoint_writers_path(task_id: str) -> str:
+    """Agents allowed to read and write the checkpoint of a task the hub
+    has not observed: those bound to the connection that first wrote it."""
+    return f"/tasks/{task_id}/checkpoint_writers.json"
 
 
 # ── Audit ────────────────────────────────────────────────────────────────────
