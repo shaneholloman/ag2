@@ -413,6 +413,11 @@ class Hub:
         # owner-emitted COMPLETED). Keyed by owner so one agent's report
         # never suppresses another's for the same id.
         self._observed_task_ids: set[tuple[str, str]] = set()
+        # task_id → non-participants that already sent it a peer cancel
+        # request (each may send one). Checked and extended under the
+        # channel's WAL lock; dropped when the task turns terminal and
+        # rebuilt from active-channel WALs on ``hydrate()``.
+        self._peer_cancel_senders: dict[str, set[str]] = {}
 
         # Per-recipient outstanding-envelope counter for ``InboxBlock.max_pending``
         # enforcement. Incremented on dispatch to that recipient,
@@ -575,6 +580,7 @@ class Hub:
         self._channel_tasks.clear()
         self._inbox_cursors.clear()
         self._causation_index.clear()
+        self._peer_cancel_senders.clear()
 
         # Identities.
         agent_children = await self._store.list(agents_root())
@@ -1910,6 +1916,7 @@ class Hub:
             if state in TERMINAL_TASK_STATES:
                 metadata.completed_at = self._clock()
                 terminal_reached = True
+                self._peer_cancel_senders.pop(task_id, None)
         await self._persist_task_metadata(metadata)
         if terminal_reached:
             # Mirror the terminal fan-out ``_transition_task`` performs, so
@@ -2060,10 +2067,10 @@ class Hub:
         # Every event comes only from participants, whatever the adapter
         # accepts — hub-generated protocol envelopes carry the creator and
         # invitees are participants from creation. The one exception is a
-        # well-formed task cancel request, which any peer may send.
-        if envelope.sender_id not in metadata.participant_ids() and not await self._is_peer_cancel_request(
-            envelope, metadata
-        ):
+        # well-formed task cancel request, which any peer may send once
+        # per task (enforced under the WAL lock below).
+        peer_cancel = envelope.sender_id not in metadata.participant_ids()
+        if peer_cancel and not self._is_peer_cancel_request(envelope, metadata):
             raise ProtocolError(
                 f"channel {envelope.channel_id!r} only accepts sends from participants, got {envelope.sender_id!r}"
             )
@@ -2118,6 +2125,10 @@ class Hub:
                     f"(manifest {metadata.manifest.type!r}@v{metadata.manifest.version} "
                     "may not be registered)"
                 )
+            if peer_cancel and envelope.sender_id in self._peer_cancel_senders.get(envelope.task_id or "", set()):
+                raise ProtocolError(
+                    f"channel {envelope.channel_id!r} only accepts sends from participants, got {envelope.sender_id!r}"
+                )
             adapter.validate_send(metadata, envelope, state)
 
             envelope.envelope_id = self._mint_envelope_id()
@@ -2134,6 +2145,8 @@ class Hub:
                 self._envelope_tracer.inject_traceparent(envelope, envelope_span)
 
             await self._wal_append(envelope)
+            if peer_cancel:
+                self._peer_cancel_senders.setdefault(envelope.task_id or "", set()).add(envelope.sender_id)
             new_state = adapter.fold(envelope, state)
             self._adapter_states[envelope.channel_id] = new_state
             result = adapter.on_accepted(metadata, envelope, new_state)
@@ -2191,21 +2204,21 @@ class Hub:
 
         return envelope.envelope_id
 
-    async def _is_peer_cancel_request(self, envelope: Envelope, metadata: ChannelMetadata) -> bool:
+    def _is_peer_cancel_request(self, envelope: Envelope, metadata: ChannelMetadata) -> bool:
         """True for a cancel request shaped as the ``tasks`` tool sends it.
 
         That is: an ``EV_TASK_CANCEL_REQUEST`` on an active channel, for a
         live task the hub has observed in that same channel, addressed
         only to the task's owner, whose ``event_data`` is exactly
         ``{"task_id", "reason"}`` naming the envelope's task with a
-        string ``reason`` — and the sender's first such request for that
-        task (the channel WAL holds none from it yet), since protocol
-        events bypass the recipient's inbox cap.
+        string ``reason``. The one-per-sender limit (protocol events
+        bypass the recipient's inbox cap) is checked separately, under
+        the channel's WAL lock, against ``_peer_cancel_senders``.
         """
         if envelope.event_type != EV_TASK_CANCEL_REQUEST or envelope.task_id is None:
             return False
         task = self._tasks.get(envelope.task_id)
-        well_formed = (
+        return (
             task is not None
             and task.state not in TERMINAL_TASK_STATES
             and metadata.state == ChannelState.ACTIVE
@@ -2214,14 +2227,6 @@ class Hub:
             and set(envelope.event_data) == {"task_id", "reason"}
             and envelope.event_data["task_id"] == envelope.task_id
             and isinstance(envelope.event_data["reason"], str)
-        )
-        if not well_formed:
-            return False
-        return not any(
-            prior.event_type == EV_TASK_CANCEL_REQUEST
-            and prior.sender_id == envelope.sender_id
-            and prior.task_id == envelope.task_id
-            for prior in await self.read_wal(envelope.channel_id)
         )
 
     # ── Endpoint management ─────────────────────────────────────────────────
@@ -3192,6 +3197,7 @@ class Hub:
             return
         metadata.state = new_state
         if new_state in TERMINAL_TASK_STATES:
+            self._peer_cancel_senders.pop(task_id, None)
             metadata.completed_at = self._clock()
             if new_state == TaskState.EXPIRED:
                 metadata.error = reason or metadata.error or "expired"
@@ -3303,6 +3309,13 @@ class Hub:
             if not metadata.is_terminal() and envelope.causation_id and envelope.envelope_id:
                 key = (channel_id, envelope.sender_id, envelope.causation_id)
                 self._causation_index[key] = envelope.envelope_id
+            if (
+                not metadata.is_terminal()
+                and envelope.event_type == EV_TASK_CANCEL_REQUEST
+                and envelope.task_id
+                and envelope.sender_id not in metadata.participant_ids()
+            ):
+                self._peer_cancel_senders.setdefault(envelope.task_id, set()).add(envelope.sender_id)
         self._adapter_states[channel_id] = state
 
     async def _load_task(self, task_id: str) -> None:

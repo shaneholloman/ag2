@@ -110,8 +110,11 @@ pattern-valid task id the reporter names and either no channel or one the
 reporter is in.
 
 A peer's cancel request is a protocol event, so it bypasses the recipient's
-inbox cap; each sender may therefore send only one per task — a second from the
-same sender for the same task (found in the channel WAL) is refused.
+inbox cap; each sender may therefore send only one per task. The hub records
+the senders per task in memory, checks and extends that record under the
+channel's WAL lock (so concurrent duplicates cannot both pass and no request
+reads the WAL), drops it when the task turns terminal, and rebuilds it from
+active channels' WALs on `hydrate`.
 `record_observation` deduplicates per `(owner_id, task_id)`, so an agent
 reporting a task id first cannot suppress the real owner's observation.
 

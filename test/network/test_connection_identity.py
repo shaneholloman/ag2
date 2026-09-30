@@ -11,6 +11,7 @@ key and tries to act as, or read the private state of, bob.
 """
 
 import asyncio
+import dataclasses
 import json
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -75,6 +76,49 @@ class _InvitePosted(BaseHubListener):
     async def on_envelope_posted(self, envelope: Envelope, metadata: ChannelMetadata) -> None:
         if envelope.event_type == EV_CHANNEL_INVITE:
             self.posted.set()
+
+
+class _WalReadCountingStore(MemoryKnowledgeStore):
+    """Counts WAL reads; each read yields to the loop, as a real store's I/O does."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.wal_reads = 0
+
+    async def read(self, path: str) -> str | None:
+        if path.endswith("/wal.jsonl"):
+            self.wal_reads += 1
+        content = await super().read(path)
+        await asyncio.sleep(0)  # hand the loop over after the read, as I/O completion does
+        return content
+
+
+async def _hub_with_live_task(store: MemoryKnowledgeStore) -> tuple[Hub, str, Envelope]:
+    """In-process hub with an alice–bob channel, bob's live task in it, and
+    carol's (a non-participant) well-formed cancel request for that task."""
+    hub = await Hub.open(store, ttl_sweep_interval=0, expectation_sweep_interval=0)
+    alice = await hub.register(_agent("alice"))
+    bob = await hub.register(_agent("bob"))
+    carol = await hub.register(_agent("carol"))
+    channel = await alice.open(type="conversation", target="bob")
+    await hub.observe_task(
+        TaskMetadata(
+            task_id="t-bob",
+            owner_id=bob.agent_id,
+            spec=TaskSpec(title="t"),
+            state=TaskState.RUNNING,
+            channel_id=channel.channel_id,
+        )
+    )
+    request = Envelope(
+        channel_id=channel.channel_id,
+        sender_id=carol.agent_id,
+        audience=[bob.agent_id],
+        event_type=EV_TASK_CANCEL_REQUEST,
+        event_data={"task_id": "t-bob", "reason": "wrap up"},
+        task_id="t-bob",
+    )
+    return hub, channel.channel_id, request
 
 
 class _TaskEvents(BaseHubListener):
@@ -446,6 +490,38 @@ class TestPeerCancelRequest:
                 await alice_hc.close()
                 await bob_hc.close()
                 await carol_hc.close()
+
+    @pytest.mark.asyncio
+    async def test_repeat_cancel_is_refused_without_reading_the_wal_even_after_hydrate(self) -> None:
+        store = _WalReadCountingStore()
+        hub, _, request = await _hub_with_live_task(store)
+        try:
+            await hub.post_envelope(dataclasses.replace(request))
+            await hub.hydrate()
+            store.wal_reads = 0
+
+            with pytest.raises(ProtocolError, match="only accepts sends from participants"):
+                await hub.post_envelope(dataclasses.replace(request))
+
+            assert store.wal_reads == 0
+        finally:
+            await hub.close()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_duplicate_cancels_accept_exactly_one(self) -> None:
+        hub, channel_id, request = await _hub_with_live_task(_WalReadCountingStore())
+        try:
+            results = await asyncio.gather(
+                hub.post_envelope(dataclasses.replace(request)),
+                hub.post_envelope(dataclasses.replace(request)),
+                return_exceptions=True,
+            )
+
+            assert sorted(type(r).__name__ for r in results) == ["ProtocolError", "str"]
+            wal = await hub.read_wal(channel_id)
+            assert sum(e.event_type == EV_TASK_CANCEL_REQUEST for e in wal) == 1
+        finally:
+            await hub.close()
 
     @pytest.mark.asyncio
     async def test_outsider_cancel_request_for_the_owners_task_is_accepted(self) -> None:
