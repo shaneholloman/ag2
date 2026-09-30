@@ -233,6 +233,10 @@ def _expires_at(now_iso: str, ttl_seconds: int) -> str:
 # human-readable ids like ``task-1`` fit.
 _TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
+# Shape of a hub-minted agent id (``make_id``). A name of this shape could
+# be mistaken for another agent's id, so none may be registered.
+_AGENT_ID_RE = re.compile(r"[0-9a-f]{32}")
+
 # Ops open to any connection: hub-wide discovery reads. ``register`` is
 # open too, except that a ``remote_agent`` needs an owner (see
 # ``Hub._authorize_request``).
@@ -1140,6 +1144,8 @@ class Hub:
             # registration's passport / resume / rule / SKILL.md would
             # be orphaned on disk under a now-unreachable agent_id.
             # Tenants must explicitly ``unregister`` first.
+            if _AGENT_ID_RE.fullmatch(passport.name) or passport.name in self._passports:
+                raise ProtocolError(f"name {passport.name!r} is, or has the shape of, an agent id")
             if passport.name in self._name_to_id:
                 raise ProtocolError(
                     f"name {passport.name!r} already registered "
@@ -1257,7 +1263,8 @@ class Hub:
         return default if default is not None else agent_id
 
     async def get_agent(self, name_or_id: str) -> Passport:
-        agent_id = self._name_to_id.get(name_or_id, name_or_id)
+        # An exact agent id wins over a name.
+        agent_id = name_or_id if name_or_id in self._passports else self._name_to_id.get(name_or_id, name_or_id)
         passport = self._passports.get(agent_id)
         if passport is None:
             raise NotFoundError(f"agent not found: {name_or_id}")
@@ -2696,6 +2703,9 @@ class Hub:
         ``register`` are open, but registering a ``remote_agent`` needs a
         non-remote agent bound here, which becomes its owner. Every task
         id named must match ``_TASK_ID_RE`` (``ProtocolError`` otherwise).
+        Task-scoped ops need a bound agent; ``fire_task_event`` for an
+        unobserved task allows only ``mirror_failed``, and a payload
+        ``owner_id`` must be bound.
         Other violations raise :class:`AccessDeniedError`, which the
         caller returns as an ``access_denied`` response.
         """
@@ -2719,10 +2729,17 @@ class Hub:
         elif op in _CHANNEL_SCOPED_OPS:
             self._require_participant(endpoint, params["channel_id"])
         elif op in _TASK_SCOPED_OPS:
+            if not self._endpoint_to_agents.get(endpoint.endpoint_id):
+                raise AccessDeniedError("connection has no bound agent")
             if params["task_id"] in self._tasks:
                 self._require_task_owner(endpoint, params["task_id"])
             elif op in ("checkpoint_task", "read_task_checkpoint"):
                 await self._require_checkpoint_writer(endpoint, params["task_id"], claim=op == "checkpoint_task")
+            elif op == "fire_task_event" and params["kind"] != "mirror_failed":
+                # Unobserved ids carry only the TaskMirror's own failure report.
+                raise AccessDeniedError(f"task {params['task_id']!r} is not observed; only 'mirror_failed' may fire")
+            if op == "fire_task_event" and params.get("payload", {}).get("owner_id") is not None:
+                self._require_bound(endpoint, params["payload"]["owner_id"])
         elif op == "post_envelope":
             self._require_bound(endpoint, params["envelope"]["sender_id"])
             event_type = params["envelope"]["event_type"]

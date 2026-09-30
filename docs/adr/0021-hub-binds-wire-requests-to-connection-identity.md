@@ -59,7 +59,9 @@ not against a stored copy — so it is dropped before the passport is cached or
 persisted, and `hydrate` drops and rewrites it in older stores. Passports in
 wire responses (`register`, `get_agent`, `list_agents`) never carry a claim. A
 client re-attaching with `attach` therefore supplies its own passport; the hub
-cannot hand the credential back. (A `remote_agent`'s claim is proxy routing
+cannot hand the credential back, and adapters validate a Hello's claim against
+their own configuration because the stored passport's claim is always empty (the
+`AuthAdapter` contract says so; `NoAuth` and `ApiKeyAuth` comply). (A `remote_agent`'s claim is proxy routing
 data; it stays in-process and is stripped from wire responses too.)
 
 A `kind="remote_agent"` passport is different: its `auth.scheme` is a routing
@@ -72,7 +74,8 @@ name that the auth registry could authenticate — a real agent's name — and
 receive the traffic addressed to it. Wire registration of `remote_agent` is
 therefore **off by default** (`Hub(allow_remote_agent_registration=False)`);
 an operator who needs wire clients to register remote agents turns it on,
-accepting that such names are first-come. We preferred this over namespacing
+accepting that unused names are first-come and that the registrant's
+`auth.scheme` / `auth.claim` become the routing data its proxy dispatches with. We preferred this over namespacing
 remote names, which would change every federated agent's name. When enabled:
 
 - registering a `remote_agent` needs a connection that already holds a
@@ -90,6 +93,16 @@ Every task id a wire request names (`task_id`, `metadata.task_id`,
 `envelope.task_id`) must be one path segment — `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`,
 which covers `uuid4().hex` and ids like `task-1` — because task ids become
 store paths. Anything else is a `ProtocolError`.
+
+Every task-scoped op needs a bound agent. `fire_task_event` reaches listeners
+(the audit log records terminal kinds with the payload's `owner_id`), so over
+the wire it is limited to the observed task's owner, or — for an id the hub has
+not observed — to the `TaskMirror`'s own `mirror_failed` report; a payload
+`owner_id` must be bound.
+
+Agent ids are what bindings and routing key on, so a name can never stand in for
+one: `get_agent` resolves an exact id before a name, and registering a name that
+equals an agent id or has its shape (32 lowercase hex) is a `ProtocolError`.
 
 Over the wire, `ag2.channel.*` events other than `invite.ack` / `invite.reject`
 (invite, opened, closed, expired) are emitted only by the hub and rejected from

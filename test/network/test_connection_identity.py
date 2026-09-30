@@ -663,3 +663,59 @@ class TestHubOnlyEvents:
             finally:
                 await alice_hc.close()
                 await bob_hc.close()
+
+
+class TestTaskEvents:
+    @pytest.mark.asyncio
+    async def test_connection_without_an_agent_cannot_fire_task_events(self) -> None:
+        async with _serve() as (hub, url):
+            bob_hc, unbound_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
+            try:
+                bob = await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
+
+                with pytest.raises(AccessDeniedError):
+                    await unbound_hc.fire_task_event(
+                        "t-forged", "completed", {"owner_id": bob.agent_id, "capability": "payments"}
+                    )
+
+                assert not any(r.get("task_id") == "t-forged" for r in await hub.audit_log.read_all())
+            finally:
+                await bob_hc.close()
+                await unbound_hc.close()
+
+    @pytest.mark.asyncio
+    async def test_agent_cannot_forge_task_events_for_unobserved_tasks_or_other_owners(self) -> None:
+        async with _serve() as (hub, url):
+            bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
+            try:
+                bob = await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
+                mallory = await mallory_hc.register(_agent("mallory"), _passport("mallory"), Resume())
+
+                with pytest.raises(AccessDeniedError):
+                    await mallory_hc.fire_task_event("t-forged", "completed", {"owner_id": mallory.agent_id})
+                with pytest.raises(AccessDeniedError):
+                    await mallory_hc.fire_task_event("t-forged", "mirror_failed", {"owner_id": bob.agent_id})
+                await mallory_hc.fire_task_event("t-own", "mirror_failed", {"owner_id": mallory.agent_id})
+
+                assert not any(r.get("task_id") == "t-forged" for r in await hub.audit_log.read_all())
+            finally:
+                await bob_hc.close()
+                await mallory_hc.close()
+
+
+class TestNames:
+    @pytest.mark.asyncio
+    async def test_a_name_cannot_shadow_an_agent_id(self) -> None:
+        async with _serve(allow_no_auth=True) as (hub, url):
+            bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
+            try:
+                bob = await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
+                assert bob.agent_id is not None
+
+                with pytest.raises(ProtocolError, match="agent id"):
+                    await mallory_hc.register(_agent("shadow"), Passport(name=bob.agent_id), Resume())
+
+                assert (await mallory_hc.get_agent(bob.agent_id)).name == "bob"
+            finally:
+                await bob_hc.close()
+                await mallory_hc.close()
