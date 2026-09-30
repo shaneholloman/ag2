@@ -19,11 +19,17 @@ import pytest
 from ag2 import Agent
 from ag2.knowledge import MemoryKnowledgeStore
 from ag2.network import (
+    EV_CHANNEL_CLOSED,
+    EV_CHANNEL_INVITE,
+    EV_CHANNEL_INVITE_REJECT,
     EV_TEXT,
     AccessDeniedError,
     ApiKeyAuth,
     AuthBlock,
     AuthRegistry,
+    BaseHubListener,
+    ChannelMetadata,
+    ChannelState,
     Envelope,
     ErrorFrame,
     HelloFrame,
@@ -51,6 +57,17 @@ def _agent(name: str) -> Agent:
 
 def _passport(name: str) -> Passport:
     return Passport(name=name, auth=AuthBlock(scheme="api_key", claim={"token": f"k-{name}"}))
+
+
+class _InvitePosted(BaseHubListener):
+    """Signals once the hub has posted a channel invite."""
+
+    def __init__(self) -> None:
+        self.posted = asyncio.Event()
+
+    async def on_envelope_posted(self, envelope: Envelope, metadata: ChannelMetadata) -> None:
+        if envelope.event_type == EV_CHANNEL_INVITE:
+            self.posted.set()
 
 
 @asynccontextmanager
@@ -181,6 +198,30 @@ class TestActingAsAnotherAgent:
                 await bob_hc.close()
                 await mallory_hc.close()
 
+    @pytest.mark.asyncio
+    async def test_observing_a_task_id_checkpointed_by_another_agent_is_denied(self) -> None:
+        async with _serve() as (_, url):
+            bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
+            try:
+                await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
+                mallory = await mallory_hc.register(_agent("mallory"), _passport("mallory"), Resume())
+                await bob_hc.checkpoint_task("t-bob", {"step": 1})
+
+                with pytest.raises(AccessDeniedError):
+                    await mallory_hc.observe_task(
+                        TaskMetadata(
+                            task_id="t-bob",
+                            owner_id=mallory.agent_id,
+                            spec=TaskSpec(title="t"),
+                            state=TaskState.RUNNING,
+                        )
+                    )
+
+                assert await bob_hc.read_task_checkpoint("t-bob") == {"step": 1}
+            finally:
+                await bob_hc.close()
+                await mallory_hc.close()
+
 
 class TestChannelScope:
     @pytest.mark.asyncio
@@ -244,6 +285,69 @@ class TestChannelScope:
             finally:
                 await alice_hc.close()
                 await bob_hc.close()
+                await mallory_hc.close()
+
+    @pytest.mark.asyncio
+    async def test_non_participant_protocol_event_is_refused(self) -> None:
+        async with _serve() as (hub, url):
+            alice_hc, bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url)), HubClient(WsLink(url))
+            try:
+                alice = await alice_hc.register(_agent("alice"), _passport("alice"), Resume())
+                await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
+                mallory = await mallory_hc.register(_agent("mallory"), _passport("mallory"), Resume())
+                channel = await alice.open(type="conversation", target="bob")
+
+                with pytest.raises(ProtocolError, match="only accepts sends from participants"):
+                    await mallory_hc.post_envelope(
+                        Envelope(
+                            channel_id=channel.channel_id,
+                            sender_id=mallory.agent_id,
+                            audience=None,
+                            event_type=EV_CHANNEL_CLOSED,
+                            event_data={"text": "injected"},
+                        )
+                    )
+
+                wal = await hub.read_wal(channel.channel_id)
+                assert not any(e.sender_id == mallory.agent_id for e in wal)
+            finally:
+                await alice_hc.close()
+                await bob_hc.close()
+                await mallory_hc.close()
+
+    @pytest.mark.asyncio
+    async def test_non_participant_invite_reject_leaves_the_channel_pending(self) -> None:
+        async with _serve() as (hub, url):
+            alice_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
+            # bob holds no connection, so the invite waits for his ack.
+            await hub.register_identity(_passport("bob"), Resume())
+            opening: asyncio.Task[object] | None = None
+            try:
+                alice = await alice_hc.register(_agent("alice"), _passport("alice"), Resume())
+                mallory = await mallory_hc.register(_agent("mallory"), _passport("mallory"), Resume())
+                invited = _InvitePosted()
+                hub.register_listener(invited)
+                opening = asyncio.create_task(alice.open(type="conversation", target="bob"))
+                await asyncio.wait_for(invited.posted.wait(), 2.0)
+                (pending,) = await hub.list_channels()
+
+                with pytest.raises(ProtocolError, match="only accepts sends from participants"):
+                    await mallory_hc.post_envelope(
+                        Envelope(
+                            channel_id=pending.channel_id,
+                            sender_id=mallory.agent_id,
+                            audience=None,
+                            event_type=EV_CHANNEL_INVITE_REJECT,
+                            event_data={"channel_id": pending.channel_id},
+                        )
+                    )
+
+                assert (await hub.get_channel(pending.channel_id)).state == ChannelState.PENDING
+            finally:
+                if opening is not None:
+                    opening.cancel()
+                    await asyncio.gather(opening, return_exceptions=True)
+                await alice_hc.close()
                 await mallory_hc.close()
 
 

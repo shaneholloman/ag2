@@ -39,7 +39,8 @@ their signatures and stay unchecked.
 - **Task-scoped** — when the hub has observed the task, its owner must be bound.
   A checkpoint of a task the hub has not observed belongs to the agents bound to
   the connection that first wrote it (recorded next to the checkpoint); later
-  reads and writes need one of them.
+  reads and writes need one of them, and so does `observe_task` for that id,
+  since observing makes the caller the task's owner.
 
 An op in no class is rejected, so a new op is unreachable until it is
 classified. A `ReceiptFrame` for an agent not bound to the connection is dropped.
@@ -51,11 +52,13 @@ existing identity is validated with the scheme that identity registered with; a
 Hello naming another scheme — e.g. `none` in a registry that also holds `NoAuth`
 — is refused with `auth_failed`.
 
-Independently of the connection, `post_envelope` accepts non-protocol events
-only from the channel's participants, in the hub rather than per adapter, so an
-adapter that forgets the check cannot let outsiders inject content. Protocol
-events keep their own rules: a peer may post a task cancel request into the
-owner's channel.
+Independently of the connection, `post_envelope` accepts events only from the
+channel's participants, in the hub rather than per adapter, so an adapter that
+forgets the check cannot let outsiders inject content. This covers protocol
+events too — an outsider's `ag2.channel.invite.reject` would otherwise fail
+another agent's handshake. Hub-generated protocol envelopes carry the creator,
+and invitees are participants from creation. The one exception is
+`ag2.task.cancel_request`, which a peer posts into the task owner's channel.
 
 ## Consequences
 

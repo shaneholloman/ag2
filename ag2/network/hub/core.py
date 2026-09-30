@@ -60,6 +60,7 @@ from ..envelope import (
     EV_CHANNEL_INVITE_ACK,
     EV_CHANNEL_INVITE_REJECT,
     EV_CHANNEL_OPENED,
+    EV_TASK_CANCEL_REQUEST,
     EV_TEXT,
     Envelope,
 )
@@ -1964,10 +1965,11 @@ class Hub:
             raise ProtocolError(f"channel {envelope.channel_id!r} is {metadata.state.value}")
         if not _is_protocol_event(envelope.event_type) and metadata.state != ChannelState.ACTIVE:
             raise ProtocolError(f"channel {envelope.channel_id!r} not active (state={metadata.state.value})")
-        # Substantive content comes only from participants, whatever the
-        # adapter accepts. Protocol events keep their own rules (a peer
-        # may post a task cancel request into the owner's channel).
-        if not _is_protocol_event(envelope.event_type) and envelope.sender_id not in metadata.participant_ids():
+        # Every event comes only from participants, whatever the adapter
+        # accepts — hub-generated protocol envelopes carry the creator and
+        # invitees are participants from creation. The one exception is a
+        # task cancel request, which a peer posts into the owner's channel.
+        if envelope.event_type != EV_TASK_CANCEL_REQUEST and envelope.sender_id not in metadata.participant_ids():
             raise ProtocolError(
                 f"channel {envelope.channel_id!r} only accepts sends from participants, got {envelope.sender_id!r}"
             )
@@ -2606,9 +2608,9 @@ class Hub:
         bound agent; channel-scoped ops need a bound participant;
         task-scoped ops need the observed task's owner to be bound, and a
         checkpoint of an unobserved task needs one of its first writer's
-        agents. Admission and discovery reads are open. Violations raise
-        :class:`AccessDeniedError`, which the caller returns as an
-        ``access_denied`` response.
+        agents, as does observing that task. Admission and discovery reads
+        are open. Violations raise :class:`AccessDeniedError`, which the
+        caller returns as an ``access_denied`` response.
         """
         if op in _UNSCOPED_OPS:
             return
@@ -2627,7 +2629,12 @@ class Hub:
             self._require_bound(endpoint, params["envelope"]["sender_id"])
         elif op == "observe_task":
             self._require_bound(endpoint, params["metadata"]["owner_id"])
-            self._require_task_owner(endpoint, params["metadata"]["task_id"])
+            if params["metadata"]["task_id"] in self._tasks:
+                self._require_task_owner(endpoint, params["metadata"]["task_id"])
+            else:
+                # Observing makes the caller the owner, so an id whose
+                # checkpoint another connection wrote stays with its writers.
+                await self._require_checkpoint_writer(endpoint, params["metadata"]["task_id"], claim=False)
         elif op == "list_channels":
             if params.get("agent_id") is not None:
                 self._require_bound(endpoint, params["agent_id"])
