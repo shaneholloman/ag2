@@ -48,6 +48,7 @@ from ag2.network import (
     serve_ws,
 )
 from ag2.network.hub.layout import passport_path
+from ag2.network.task_mirror import TaskMirror
 from ag2.task import TaskMetadata, TaskSpec, TaskState
 
 from ._helpers import ScriptedConfig
@@ -72,6 +73,16 @@ class _InvitePosted(BaseHubListener):
     async def on_envelope_posted(self, envelope: Envelope, metadata: ChannelMetadata) -> None:
         if envelope.event_type == EV_CHANNEL_INVITE:
             self.posted.set()
+
+
+class _TaskEvents(BaseHubListener):
+    """Collects every task event the hub fans out."""
+
+    def __init__(self, fired: list[tuple[str, str, dict]]) -> None:
+        self.fired = fired
+
+    async def on_task_event(self, task_id: str, kind: str, payload: dict) -> None:
+        self.fired.append((task_id, kind, payload))
 
 
 @asynccontextmanager
@@ -483,6 +494,24 @@ class TestPeerCancelRequest:
 
 class TestReattach:
     @pytest.mark.asyncio
+    async def test_hello_with_a_non_object_claim_is_refused(self) -> None:
+        async with _serve() as (_, url):
+            bob_hc = HubClient(WsLink(url))
+            link = WsLinkClient(url)
+            try:
+                await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
+                await link.open()
+
+                await link.send_frame(HelloFrame(name="bob", auth_scheme="api_key", auth_claim="k-bob"))  # type: ignore[arg-type]
+                reply = await asyncio.wait_for(anext(aiter(link.frames())), 2.0)
+
+                assert isinstance(reply, ErrorFrame)
+                assert reply.code == "auth_failed"
+            finally:
+                await bob_hc.close()
+                await link.close()
+
+    @pytest.mark.asyncio
     async def test_reattach_moves_the_identity_to_the_new_connection(self) -> None:
         async with _serve() as (hub, url):
             old_hc, new_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
@@ -701,6 +730,73 @@ class TestTaskEvents:
             finally:
                 await bob_hc.close()
                 await mallory_hc.close()
+
+    @pytest.mark.asyncio
+    async def test_mirror_failure_naming_a_foreign_channel_or_extra_fields_is_refused(self) -> None:
+        async with _serve() as (hub, url):
+            alice_hc, bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url)), HubClient(WsLink(url))
+            try:
+                alice = await alice_hc.register(_agent("alice"), _passport("alice"), Resume())
+                await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
+                mallory = await mallory_hc.register(_agent("mallory"), _passport("mallory"), Resume())
+                channel = await alice.open(type="conversation", target="bob")
+
+                with pytest.raises(ProtocolError):
+                    await mallory_hc.fire_task_event(
+                        "x-1",
+                        "mirror_failed",
+                        {"channel_id": channel.channel_id, "capability": "payments", "outcome": "completed"},
+                    )
+                with pytest.raises(AccessDeniedError):
+                    await mallory_hc.fire_task_event(
+                        "x-1", "mirror_failed", {"owner_id": mallory.agent_id, "channel_id": channel.channel_id}
+                    )
+            finally:
+                await alice_hc.close()
+                await bob_hc.close()
+                await mallory_hc.close()
+
+    @pytest.mark.asyncio
+    async def test_terminal_task_event_for_an_observed_task_is_refused(self) -> None:
+        async with _serve() as (hub, url):
+            mallory_hc = HubClient(WsLink(url))
+            try:
+                mallory = await mallory_hc.register(_agent("mallory"), _passport("mallory"), Resume())
+                await mallory_hc.observe_task(
+                    TaskMetadata(
+                        task_id="m-1", owner_id=mallory.agent_id, spec=TaskSpec(title="t"), state=TaskState.RUNNING
+                    )
+                )
+
+                with pytest.raises(AccessDeniedError):
+                    await mallory_hc.fire_task_event("m-1", "completed", {"reason": "forged"})
+
+                assert not any(r.get("task_id") == "m-1" for r in await hub.audit_log.read_all())
+                assert (await hub.get_task("m-1")).state == TaskState.RUNNING
+            finally:
+                await mallory_hc.close()
+
+    @pytest.mark.asyncio
+    async def test_task_mirror_reports_its_failure_over_the_wire(self) -> None:
+        async with _serve() as (hub, url):
+            alice_hc, bob_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
+            fired: list[tuple[str, str, dict]] = []
+            listener = _TaskEvents(fired)
+            hub.register_listener(listener)
+            try:
+                alice = await alice_hc.register(_agent("alice"), _passport("alice"), Resume())
+                await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
+                channel = await alice.open(type="conversation", target="bob")
+                mirror = TaskMirror(hub_client=alice_hc, owner_id=alice.agent_id, channel_id=channel.channel_id)
+
+                await mirror._escalate("t-alice", "observe", RuntimeError("store down"))
+
+                assert [(t, k, p["channel_id"]) for t, k, p in fired] == [
+                    ("t-alice", "mirror_failed", channel.channel_id)
+                ]
+            finally:
+                await alice_hc.close()
+                await bob_hc.close()
 
 
 class TestNames:

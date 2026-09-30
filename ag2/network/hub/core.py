@@ -233,6 +233,10 @@ def _expires_at(now_iso: str, ttl_seconds: int) -> str:
 # human-readable ids like ``task-1`` fit.
 _TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
+# Payload keys of ``TaskMirror``'s ``mirror_failed`` report — the only task
+# event a wire client may fire.
+_MIRROR_FAILURE_KEYS: frozenset[str] = frozenset({"op", "owner_id", "channel_id", "exc_type", "exc_message"})
+
 # Shape of a hub-minted agent id (``make_id``). A name of this shape could
 # be mistaken for another agent's id, so none may be registered.
 _AGENT_ID_RE = re.compile(r"[0-9a-f]{32}")
@@ -2446,6 +2450,8 @@ class Hub:
                 await endpoint.send_frame(ErrorFrame(code="not_found", message=f"no passport for {frame.name}"))
                 return
             try:
+                if not isinstance(frame.auth_claim, dict):
+                    raise AuthError("auth_claim must be a JSON object")
                 # A remote_agent's scheme is a routing label, not a credential:
                 # it re-attaches only on a connection holding one of its owners.
                 # Any other identity re-attaches with its registered scheme;
@@ -2703,9 +2709,9 @@ class Hub:
         ``register`` are open, but registering a ``remote_agent`` needs a
         non-remote agent bound here, which becomes its owner. Every task
         id named must match ``_TASK_ID_RE`` (``ProtocolError`` otherwise).
-        Task-scoped ops need a bound agent; ``fire_task_event`` for an
-        unobserved task allows only ``mirror_failed``, and a payload
-        ``owner_id`` must be bound.
+        Task-scoped ops need a bound agent; ``fire_task_event`` is
+        limited to the mirror's ``mirror_failed`` report (see
+        :meth:`_authorize_mirror_failure`).
         Other violations raise :class:`AccessDeniedError`, which the
         caller returns as an ``access_denied`` response.
         """
@@ -2731,15 +2737,12 @@ class Hub:
         elif op in _TASK_SCOPED_OPS:
             if not self._endpoint_to_agents.get(endpoint.endpoint_id):
                 raise AccessDeniedError("connection has no bound agent")
-            if params["task_id"] in self._tasks:
+            if op == "fire_task_event":
+                self._authorize_mirror_failure(endpoint, params["task_id"], params["kind"], params.get("payload", {}))
+            elif params["task_id"] in self._tasks:
                 self._require_task_owner(endpoint, params["task_id"])
             elif op in ("checkpoint_task", "read_task_checkpoint"):
                 await self._require_checkpoint_writer(endpoint, params["task_id"], claim=op == "checkpoint_task")
-            elif op == "fire_task_event" and params["kind"] != "mirror_failed":
-                # Unobserved ids carry only the TaskMirror's own failure report.
-                raise AccessDeniedError(f"task {params['task_id']!r} is not observed; only 'mirror_failed' may fire")
-            if op == "fire_task_event" and params.get("payload", {}).get("owner_id") is not None:
-                self._require_bound(endpoint, params["payload"]["owner_id"])
         elif op == "post_envelope":
             self._require_bound(endpoint, params["envelope"]["sender_id"])
             event_type = params["envelope"]["event_type"]
@@ -2768,6 +2771,36 @@ class Hub:
                 self._require_bound(endpoint, params["agent_id"])
         else:
             raise ProtocolError(f"unknown control-plane op: {op!r}")
+
+    def _authorize_mirror_failure(self, endpoint: LinkEndpoint, task_id: str, kind: str, payload: object) -> None:
+        """Admit a wire ``fire_task_event`` only as a ``TaskMirror`` failure report.
+
+        Listeners record task events as they come (the audit log keys
+        ``task_terminated`` on the payload's owner and channel), and the
+        hub emits real terminal events itself from ``update_task``. So
+        over the wire only ``mirror_failed`` is accepted, with exactly
+        the mirror's payload keys; its ``owner_id`` must be bound (and be
+        the owner of an observed task), and its ``channel_id`` must be
+        the observed task's channel or, for an unobserved task, one the
+        owner participates in.
+        """
+        if kind != "mirror_failed":
+            raise AccessDeniedError(f"only 'mirror_failed' task events are accepted over the wire, got {kind!r}")
+        if not isinstance(payload, dict) or not set(payload) <= _MIRROR_FAILURE_KEYS:
+            raise ProtocolError(f"mirror_failed payload keys must be within {sorted(_MIRROR_FAILURE_KEYS)}")
+        owner_id = payload.get("owner_id")
+        channel_id = payload.get("channel_id")
+        if not isinstance(owner_id, str):
+            raise ProtocolError("mirror_failed payload needs the reporting agent's owner_id")
+        self._require_bound(endpoint, owner_id)
+        task = self._tasks.get(task_id)
+        if task is not None:
+            if task.owner_id != owner_id or (channel_id or None) != (task.channel_id or None):
+                raise AccessDeniedError(f"mirror_failed for task {task_id!r} must carry its own owner and channel")
+        elif channel_id is not None:
+            channel = self._channels.get(channel_id) if isinstance(channel_id, str) else None
+            if channel is None or owner_id not in channel.participant_ids():
+                raise AccessDeniedError(f"task owner is not a participant of channel {channel_id!r}")
 
     def _remote_owner_candidates(self, endpoint: LinkEndpoint) -> list[str]:
         """Non-remote agents bound to ``endpoint``, sorted — the owners a

@@ -95,14 +95,26 @@ which covers `uuid4().hex` and ids like `task-1` — because task ids become
 store paths. Anything else is a `ProtocolError`.
 
 Every task-scoped op needs a bound agent. `fire_task_event` reaches listeners
-(the audit log records terminal kinds with the payload's `owner_id`), so over
-the wire it is limited to the observed task's owner, or — for an id the hub has
-not observed — to the `TaskMirror`'s own `mirror_failed` report; a payload
-`owner_id` must be bound.
+verbatim — the audit log records terminal kinds keyed on the payload's
+`owner_id` / `channel_id` / `outcome` / `capability`, and telemetry opens a task
+span linked to the payload's channel — while the hub emits real terminal events
+itself from `update_task`. So over the wire the only task event accepted is the
+`TaskMirror`'s `mirror_failed` report, with exactly its payload keys (`op`,
+`owner_id`, `channel_id`, `exc_type`, `exc_message`). Its `owner_id` must be
+bound and, for an observed task, be that task's owner with the task's own
+channel; for an unobserved task any `channel_id` must be one the owner
+participates in. Telemetry still records `mirror_failed` as a failed task span;
+with these constraints that span names only the reporter's own task and channel.
 
 Agent ids are what bindings and routing key on, so a name can never stand in for
-one: `get_agent` resolves an exact id before a name, and registering a name that
-equals an agent id or has its shape (32 lowercase hex) is a `ProtocolError`.
+one: `get_agent` and the workflow adapter's handoff routing resolve an exact id
+before a name, and registering a name that equals an agent id or has its shape
+(32 lowercase hex) is a `ProtocolError`. Names that merely resemble an id or
+another name (upper-case hex, dashed UUIDs, trailing spaces, look-alike
+characters) are still accepted: they cannot misroute, but can mislead a reader.
+
+A `HelloFrame` whose `auth_claim` is not a JSON object is refused with
+`auth_failed` before any adapter sees it.
 
 Over the wire, `ag2.channel.*` events other than `invite.ack` / `invite.reject`
 (invite, opened, closed, expired) are emitted only by the hub and rejected from
