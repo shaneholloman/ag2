@@ -205,6 +205,39 @@ def _public_passport(passport: Passport) -> dict[str, Any]:
     return _without_claim(passport).to_dict()
 
 
+def _malformed_field(frame: Frame) -> str | None:
+    """Name the first field of an inbound frame whose JSON type is wrong, or ``None``.
+
+    Frames arrive as decoded JSON, so their annotated types are not
+    enforced; a string field holding a list would otherwise raise deep in
+    the handler and drop the connection.
+    """
+    if isinstance(frame, HelloFrame):
+        fields: tuple[tuple[str, object, bool], ...] = (
+            ("name", frame.name, False),
+            ("auth_scheme", frame.auth_scheme, False),
+            ("since_envelope_id", frame.since_envelope_id, True),
+        )
+    elif isinstance(frame, ReceiptFrame):
+        fields = (
+            ("envelope_id", frame.envelope_id, False),
+            ("status", frame.status, False),
+            ("recipient_id", frame.recipient_id, False),
+            ("channel_id", frame.channel_id, False),
+            ("reason", frame.reason, False),
+        )
+    elif isinstance(frame, RequestFrame):
+        if not isinstance(frame.params, dict):
+            return "params"
+        fields = (("request_id", frame.request_id, False), ("op", frame.op, False))
+    else:
+        return None
+    for name, value, optional in fields:
+        if not (isinstance(value, str) or (optional and value is None)):
+            return name
+    return None
+
+
 def _wire_task_ids(params: dict[str, Any]) -> list[object]:
     """Task ids a wire request names: top-level, in task metadata, or on an envelope."""
     ids = [params.get("task_id")]
@@ -373,11 +406,13 @@ class Hub:
         # Task caches (observed; not owned).
         self._tasks: dict[str, TaskMetadata] = {}
         self._channel_tasks: dict[str, set[str]] = {}
-        # task_ids whose terminal observation has been recorded into
-        # the owner's ``Resume.observed`` already. Prevents double-counting
-        # when the same task receives multiple terminal events (e.g. a
-        # channel-cascade EXPIRED followed by an owner-emitted COMPLETED).
-        self._observed_task_ids: set[str] = set()
+        # (owner_id, task_id) pairs whose terminal observation has been
+        # recorded into the owner's ``Resume.observed`` already. Prevents
+        # double-counting when the same task receives multiple terminal
+        # events (e.g. a channel-cascade EXPIRED followed by an
+        # owner-emitted COMPLETED). Keyed by owner so one agent's report
+        # never suppresses another's for the same id.
+        self._observed_task_ids: set[tuple[str, str]] = set()
 
         # Per-recipient outstanding-envelope counter for ``InboxBlock.max_pending``
         # enforcement. Incremented on dispatch to that recipient,
@@ -1466,7 +1501,7 @@ class Hub:
         """
         if outcome not in TERMINAL_TASK_STATES:
             return
-        if task_id is not None and task_id in self._observed_task_ids:
+        if task_id is not None and (owner_id, task_id) in self._observed_task_ids:
             return
         resume = self._resumes.get(owner_id)
         if resume is None:
@@ -1492,7 +1527,7 @@ class Hub:
             await self._persist_capability_index()
 
         if task_id is not None:
-            self._observed_task_ids.add(task_id)
+            self._observed_task_ids.add((owner_id, task_id))
 
         await self._fan_out(
             "on_agent_event",
@@ -2026,7 +2061,7 @@ class Hub:
         # accepts — hub-generated protocol envelopes carry the creator and
         # invitees are participants from creation. The one exception is a
         # well-formed task cancel request, which any peer may send.
-        if envelope.sender_id not in metadata.participant_ids() and not self._is_peer_cancel_request(
+        if envelope.sender_id not in metadata.participant_ids() and not await self._is_peer_cancel_request(
             envelope, metadata
         ):
             raise ProtocolError(
@@ -2156,19 +2191,21 @@ class Hub:
 
         return envelope.envelope_id
 
-    def _is_peer_cancel_request(self, envelope: Envelope, metadata: ChannelMetadata) -> bool:
+    async def _is_peer_cancel_request(self, envelope: Envelope, metadata: ChannelMetadata) -> bool:
         """True for a cancel request shaped as the ``tasks`` tool sends it.
 
         That is: an ``EV_TASK_CANCEL_REQUEST`` on an active channel, for a
         live task the hub has observed in that same channel, addressed
         only to the task's owner, whose ``event_data`` is exactly
         ``{"task_id", "reason"}`` naming the envelope's task with a
-        string ``reason``.
+        string ``reason`` — and the sender's first such request for that
+        task (the channel WAL holds none from it yet), since protocol
+        events bypass the recipient's inbox cap.
         """
         if envelope.event_type != EV_TASK_CANCEL_REQUEST or envelope.task_id is None:
             return False
         task = self._tasks.get(envelope.task_id)
-        return (
+        well_formed = (
             task is not None
             and task.state not in TERMINAL_TASK_STATES
             and metadata.state == ChannelState.ACTIVE
@@ -2177,6 +2214,14 @@ class Hub:
             and set(envelope.event_data) == {"task_id", "reason"}
             and envelope.event_data["task_id"] == envelope.task_id
             and isinstance(envelope.event_data["reason"], str)
+        )
+        if not well_formed:
+            return False
+        return not any(
+            prior.event_type == EV_TASK_CANCEL_REQUEST
+            and prior.sender_id == envelope.sender_id
+            and prior.task_id == envelope.task_id
+            for prior in await self.read_wal(envelope.channel_id)
         )
 
     # ── Endpoint management ─────────────────────────────────────────────────
@@ -2437,6 +2482,12 @@ class Hub:
                 self._agent_to_endpoint.pop(agent_id, None)
 
     async def _dispatch_frame(self, endpoint: LinkEndpoint, frame: Frame) -> None:
+        malformed = _malformed_field(frame)
+        if malformed is not None:
+            await endpoint.send_frame(
+                ErrorFrame(code="protocol_error", message=f"malformed {frame.kind} frame: {malformed}")
+            )
+            return
         if isinstance(frame, RequestFrame):
             await self._handle_request(endpoint, frame)
         elif isinstance(frame, HelloFrame):

@@ -103,8 +103,22 @@ itself from `update_task`. So over the wire the only task event accepted is the
 `owner_id`, `channel_id`, `exc_type`, `exc_message`). Its `owner_id` must be
 bound and, for an observed task, be that task's owner with the task's own
 channel; for an unobserved task any `channel_id` must be one the owner
-participates in. Telemetry still records `mirror_failed` as a failed task span;
-with these constraints that span names only the reporter's own task and channel.
+participates in. Telemetry still records `mirror_failed` as a failed task span.
+Its owner is always the reporting agent; for an observed task it carries that
+task's own id and channel, while for an unobserved task it carries whatever
+pattern-valid task id the reporter names and either no channel or one the
+reporter is in.
+
+A peer's cancel request is a protocol event, so it bypasses the recipient's
+inbox cap; each sender may therefore send only one per task — a second from the
+same sender for the same task (found in the channel WAL) is refused.
+`record_observation` deduplicates per `(owner_id, task_id)`, so an agent
+reporting a task id first cannot suppress the real owner's observation.
+
+Inbound frames are decoded JSON, so field types are not guaranteed. A
+`HelloFrame`, `ReceiptFrame` or `RequestFrame` whose fields have the wrong JSON
+type gets an `ErrorFrame(code="protocol_error")` and the connection stays open,
+matching how an unknown op or a failed handshake is answered.
 
 Agent ids are what bindings and routing key on, so a name can never stand in for
 one: `get_agent` and the workflow adapter's handoff routing resolve an exact id
@@ -150,5 +164,5 @@ participant of the task's `channel_id`.
   tool's `scope="all"` lists across owners — so agents must not put anything in
   a task spec or result that other agents on the hub may not read.
 - A checkpoint written only in-process (or before writers were recorded) has no
-  recorded writer and stays readable by any connection until its first write
-  over the wire.
+  recorded writer: any connection with a bound agent can read it, and the first
+  one to write it over the wire claims it.

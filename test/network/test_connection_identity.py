@@ -40,6 +40,8 @@ from ag2.network import (
     HubClient,
     NoAuth,
     Passport,
+    PingFrame,
+    PongFrame,
     ProtocolError,
     ReceiptFrame,
     Resume,
@@ -407,6 +409,44 @@ class TestChannelScope:
 
 
 class TestPeerCancelRequest:
+    @pytest.mark.asyncio
+    async def test_outsider_sends_one_cancel_request_per_task(self) -> None:
+        async with _serve() as (hub, url):
+            alice_hc, bob_hc, carol_hc = HubClient(WsLink(url)), HubClient(WsLink(url)), HubClient(WsLink(url))
+            try:
+                alice = await alice_hc.register(_agent("alice"), _passport("alice"), Resume())
+                bob = await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
+                carol = await carol_hc.register(_agent("carol"), _passport("carol"), Resume())
+                channel = await alice.open(type="conversation", target="bob")
+                await bob_hc.observe_task(
+                    TaskMetadata(
+                        task_id="t-bob",
+                        owner_id=bob.agent_id,
+                        spec=TaskSpec(title="t"),
+                        state=TaskState.RUNNING,
+                        channel_id=channel.channel_id,
+                    )
+                )
+                request = Envelope(
+                    channel_id=channel.channel_id,
+                    sender_id=carol.agent_id,
+                    audience=[bob.agent_id],
+                    event_type=EV_TASK_CANCEL_REQUEST,
+                    event_data={"task_id": "t-bob", "reason": "wrap up"},
+                    task_id="t-bob",
+                )
+
+                await carol_hc.post_envelope(request)
+                with pytest.raises(ProtocolError, match="only accepts sends from participants"):
+                    await carol_hc.post_envelope(request)
+
+                wal = await hub.read_wal(channel.channel_id)
+                assert sum(e.event_type == EV_TASK_CANCEL_REQUEST for e in wal) == 1
+            finally:
+                await alice_hc.close()
+                await bob_hc.close()
+                await carol_hc.close()
+
     @pytest.mark.asyncio
     async def test_outsider_cancel_request_for_the_owners_task_is_accepted(self) -> None:
         async with _serve() as (hub, url):
@@ -798,6 +838,31 @@ class TestTaskEvents:
                 await alice_hc.close()
                 await bob_hc.close()
 
+    @pytest.mark.asyncio
+    async def test_observation_recorded_by_another_agent_does_not_suppress_the_owners(self) -> None:
+        async with _serve() as (hub, url):
+            bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
+            try:
+                bob = await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
+                mallory = await mallory_hc.register(_agent("mallory"), _passport("mallory"), Resume())
+                await mallory_hc.record_observation(
+                    owner_id=mallory.agent_id, capability="payments", outcome=TaskState.COMPLETED, task_id="t-bob"
+                )
+                await bob_hc.observe_task(
+                    TaskMetadata(
+                        task_id="t-bob", owner_id=bob.agent_id, spec=TaskSpec(title="t"), state=TaskState.RUNNING
+                    )
+                )
+
+                await bob_hc.record_observation(
+                    owner_id=bob.agent_id, capability="payments", outcome=TaskState.COMPLETED, task_id="t-bob"
+                )
+
+                assert (await hub.get_resume(bob.agent_id)).observed["payments"].completed == 1
+            finally:
+                await bob_hc.close()
+                await mallory_hc.close()
+
 
 class TestNames:
     @pytest.mark.asyncio
@@ -815,3 +880,34 @@ class TestNames:
             finally:
                 await bob_hc.close()
                 await mallory_hc.close()
+
+
+class TestMalformedFrames:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "frame",
+        [
+            HelloFrame(name=["bob"]),  # type: ignore[arg-type]
+            HelloFrame(name="bob", since_envelope_id=5),  # type: ignore[arg-type]
+            ReceiptFrame(envelope_id="e-1", status="ack", recipient_id=["bob"], channel_id="c-1"),  # type: ignore[arg-type]
+        ],
+        ids=["hello-name-list", "hello-since-int", "receipt-recipient-list"],
+    )
+    async def test_malformed_frame_gets_an_error_and_keeps_the_connection(self, frame: object) -> None:
+        async with _serve(allow_no_auth=True) as (hub, url):
+            await hub.register_identity(Passport(name="bob"), Resume())
+            link = WsLinkClient(url)
+            try:
+                await link.open()
+                frames = aiter(link.frames())
+
+                await link.send_frame(frame)  # type: ignore[arg-type]
+                reply = await asyncio.wait_for(anext(frames), 2.0)
+                await link.send_frame(PingFrame())
+                pong = await asyncio.wait_for(anext(frames), 2.0)
+
+                assert isinstance(reply, ErrorFrame)
+                assert reply.code == "protocol_error"
+                assert isinstance(pong, PongFrame)
+            finally:
+                await link.close()
