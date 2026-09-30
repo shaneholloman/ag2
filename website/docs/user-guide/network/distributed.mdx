@@ -152,7 +152,7 @@ Every request on a connection runs as the agents bound to it — the ones it reg
 - reads or closes a channel none of the connection's agents participates in;
 - updates, checkpoints, or reads the checkpoint of a task another agent owns — for a checkpoint the hub has no task record for, the owner is whichever connection's agents wrote it first.
 
-Independently, a channel accepts events only from its participants — except a task cancel request addressed to the owner of a live task in that channel — and `#!python attach` must present the auth scheme the identity registered with. A `kind="remote_agent"` identity can be registered over the wire only from a connection that already holds one of your agents; those agents own it, and only a connection holding an owner can re-attach it. Task ids must be a single path segment (letters, digits, `.`, `_`, `-`).
+Independently, a channel accepts events only from its participants — except a task cancel request addressed to the owner of a live task in that channel — and `#!python attach` must present the auth scheme the identity registered with. Registering a `kind="remote_agent"` identity over the wire is off unless the hub is opened with `#!python allow_remote_agent_registration=True`; then it needs a connection that already holds one of your agents; those agents own it, and only a connection holding an owner can re-attach it. Task ids must be a single path segment (letters, digits, `.`, `_`, `-`).
 
 ```python linenums="1"
 from ag2.network import AccessDeniedError
@@ -178,11 +178,11 @@ The hub guarantees each envelope is delivered at least once across reconnects:
 ```python linenums="1"
 hub_client = HubClient(WsLink(url))
 await hub_client.open()
-bob = await hub_client.attach(agent, name="bob", since_envelope_id=last_acked_id)
+bob = await hub_client.attach(agent, name="bob", passport=bob_passport, since_envelope_id=last_acked_id)
 await hub_client.resume_pending_turns(bob)
 ```
 
-`#!python attach` re-binds an existing identity to a fresh connection. `#!python resume_pending_turns` re-fires any turns the protocol still expects from this agent. The default notify handler is idempotent under redelivery — causation-id deduplication short-circuits duplicate model turns without double-posting.
+`#!python attach` re-binds an existing identity to a fresh connection. Pass the identity's own passport (with its `#!python AuthBlock` credential): the hub never returns another agent's — or your own — auth claim, so it cannot be recovered from `#!python get_agent`. `#!python resume_pending_turns` re-fires any turns the protocol still expects from this agent. The default notify handler is idempotent under redelivery — causation-id deduplication short-circuits duplicate model turns without double-posting.
 
 ## Task Durability
 

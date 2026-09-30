@@ -11,6 +11,7 @@ key and tries to act as, or read the private state of, bob.
 """
 
 import asyncio
+import json
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
@@ -22,6 +23,7 @@ from ag2.network import (
     EV_CHANNEL_CLOSED,
     EV_CHANNEL_INVITE,
     EV_CHANNEL_INVITE_REJECT,
+    EV_TASK_CANCELLED,
     EV_TASK_CANCEL_REQUEST,
     EV_TEXT,
     AccessDeniedError,
@@ -45,6 +47,7 @@ from ag2.network import (
     WsLinkClient,
     serve_ws,
 )
+from ag2.network.hub.layout import passport_path
 from ag2.task import TaskMetadata, TaskSpec, TaskState
 
 from ._helpers import ScriptedConfig
@@ -72,13 +75,14 @@ class _InvitePosted(BaseHubListener):
 
 
 @asynccontextmanager
-async def _serve(*, allow_no_auth: bool = False) -> AsyncGenerator[tuple[Hub, str]]:
+async def _serve(*, allow_no_auth: bool = False, allow_remote_agents: bool = False) -> AsyncGenerator[tuple[Hub, str]]:
     api_key = ApiKeyAuth(keys={name: f"k-{name}" for name in _NAMES})
     hub = await Hub.open(
         MemoryKnowledgeStore(),
         auth=AuthRegistry([NoAuth(), api_key] if allow_no_auth else [api_key]),
         ttl_sweep_interval=0,
         expectation_sweep_interval=0,
+        allow_remote_agent_registration=allow_remote_agents,
     )
     try:
         async with serve_ws(hub, "127.0.0.1", 0) as server:
@@ -304,7 +308,7 @@ class TestChannelScope:
                             channel_id=channel.channel_id,
                             sender_id=mallory.agent_id,
                             audience=None,
-                            event_type=EV_CHANNEL_CLOSED,
+                            event_type=EV_TASK_CANCELLED,
                             event_data={"text": "injected"},
                         )
                     )
@@ -516,8 +520,29 @@ class TestReattach:
 
 class TestRemoteAgent:
     @pytest.mark.asyncio
+    async def test_wire_remote_agent_registration_is_off_by_default(self) -> None:
+        async with _serve() as (_, url):
+            mallory_hc, carol_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
+            try:
+                await mallory_hc.register(_agent("mallory"), _passport("mallory"), Resume())
+
+                with pytest.raises(AccessDeniedError):
+                    await mallory_hc.register(
+                        _agent("carol"),
+                        Passport(name="carol", kind="remote_agent", auth=AuthBlock(scheme="whatever")),
+                        Resume(),
+                        attach_plugin=False,
+                    )
+
+                carol = await carol_hc.register(_agent("carol"), _passport("carol"), Resume())
+                assert carol.agent_id is not None
+            finally:
+                await mallory_hc.close()
+                await carol_hc.close()
+
+    @pytest.mark.asyncio
     async def test_connection_without_an_agent_cannot_register_a_remote_agent(self) -> None:
-        async with _serve(allow_no_auth=True) as (hub, url):
+        async with _serve(allow_no_auth=True, allow_remote_agents=True) as (hub, url):
             keyless_hc = HubClient(WsLink(url))
             try:
                 with pytest.raises(AccessDeniedError):
@@ -531,7 +556,7 @@ class TestRemoteAgent:
 
     @pytest.mark.asyncio
     async def test_hello_as_a_remote_agent_without_its_owner_is_refused(self) -> None:
-        async with _serve(allow_no_auth=True) as (_, url):
+        async with _serve(allow_no_auth=True, allow_remote_agents=True) as (_, url):
             owner_hc = HubClient(WsLink(url))
             keyless_link = WsLinkClient(url)
             try:
@@ -552,7 +577,7 @@ class TestRemoteAgent:
 
     @pytest.mark.asyncio
     async def test_owner_reattaches_its_remote_agent_on_a_new_connection(self) -> None:
-        async with _serve(allow_no_auth=True) as (hub, url):
+        async with _serve(allow_no_auth=True, allow_remote_agents=True) as (hub, url):
             first_hc, second_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
             try:
                 await first_hc.register(_agent("alice"), _passport("alice"), Resume())
@@ -573,3 +598,68 @@ class TestRemoteAgent:
             finally:
                 await first_hc.close()
                 await second_hc.close()
+
+
+class TestCredentials:
+    @pytest.mark.asyncio
+    async def test_passports_read_over_the_wire_carry_no_claim(self) -> None:
+        async with _serve() as (_, url):
+            bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
+            try:
+                bob = await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
+                await mallory_hc.register(_agent("mallory"), _passport("mallory"), Resume())
+
+                assert bob.passport.auth.claim == {}
+                assert (await mallory_hc.get_agent("bob")).auth == AuthBlock(scheme="api_key")
+                assert [p.auth.claim for p in await mallory_hc.list_agents()] == [{}, {}]
+            finally:
+                await bob_hc.close()
+                await mallory_hc.close()
+
+    @pytest.mark.asyncio
+    async def test_claim_is_not_kept_in_the_store(self) -> None:
+        async with _serve() as (hub, url):
+            bob_hc = HubClient(WsLink(url))
+            try:
+                bob = await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
+                assert bob.agent_id is not None
+                assert "k-bob" not in (await hub._store.read(passport_path(bob.agent_id)) or "")
+
+                # A store written before claims were dropped is cleaned on hydrate.
+                legacy = await hub.get_agent(bob.agent_id)
+                legacy_dict = legacy.to_dict()
+                legacy_dict["auth"]["claim"] = {"token": "k-bob"}
+                await hub._store.write(passport_path(bob.agent_id), json.dumps(legacy_dict))
+                await hub.hydrate()
+
+                assert (await hub.get_agent(bob.agent_id)).auth.claim == {}
+                assert "k-bob" not in (await hub._store.read(passport_path(bob.agent_id)) or "")
+            finally:
+                await bob_hc.close()
+
+
+class TestHubOnlyEvents:
+    @pytest.mark.asyncio
+    async def test_participant_cannot_post_a_hub_only_channel_event(self) -> None:
+        async with _serve() as (hub, url):
+            alice_hc, bob_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
+            try:
+                alice = await alice_hc.register(_agent("alice"), _passport("alice"), Resume())
+                bob = await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
+                channel = await alice.open(type="conversation", target="bob")
+
+                with pytest.raises(ProtocolError, match="emitted only by the hub"):
+                    await bob_hc.post_envelope(
+                        Envelope(
+                            channel_id=channel.channel_id,
+                            sender_id=bob.agent_id,
+                            audience=None,
+                            event_type=EV_CHANNEL_CLOSED,
+                            event_data={"channel_id": channel.channel_id, "reason": "fake"},
+                        )
+                    )
+
+                assert (await hub.get_channel(channel.channel_id)).state == ChannelState.ACTIVE
+            finally:
+                await alice_hc.close()
+                await bob_hc.close()

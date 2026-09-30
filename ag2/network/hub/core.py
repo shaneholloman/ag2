@@ -195,6 +195,16 @@ def _is_protocol_event(event_type: str) -> bool:
     return _is_channel_protocol_event(event_type) or _is_task_event(event_type)
 
 
+def _without_claim(passport: Passport) -> Passport:
+    """Copy of ``passport`` whose ``auth`` keeps the scheme but no claim."""
+    return dataclasses.replace(passport, auth=dataclasses.replace(passport.auth, claim={}))
+
+
+def _public_passport(passport: Passport) -> dict[str, Any]:
+    """Wire form of ``passport``: never carries an ``auth.claim``."""
+    return _without_claim(passport).to_dict()
+
+
 def _wire_task_ids(params: dict[str, Any]) -> list[object]:
     """Task ids a wire request names: top-level, in task metadata, or on an envelope."""
     ids = [params.get("task_id")]
@@ -290,6 +300,7 @@ class Hub:
         expectation_sweep_interval: float = 10.0,
         invite_ack_timeout: float = 30.0,
         tracer_provider: object | None = None,
+        allow_remote_agent_registration: bool = False,
     ) -> None:
         # __init__ stores params; side effects deferred to start()/hydrate().
         self._store = store
@@ -298,6 +309,9 @@ class Hub:
         self._ttl_sweep_interval = ttl_sweep_interval
         self._expectation_sweep_interval = expectation_sweep_interval
         self._invite_ack_timeout = invite_ack_timeout
+        # Off by default: federation operators register ``remote_agent``
+        # identities in-process; wire clients may only when this is set.
+        self._allow_remote_agent_registration = allow_remote_agent_registration
 
         # Opt-in: when ``tracer_provider`` is given, the hub brackets WAL
         # append + dispatch in a span and injects its W3C traceparent into
@@ -453,6 +467,7 @@ class Hub:
         invite_ack_timeout: float = 30.0,
         tracer_provider: object | None = None,
         register_default_adapters: bool = True,
+        allow_remote_agent_registration: bool = False,
     ) -> "Hub":
         """Construct + hydrate from disk + start sweepers. Production entry point.
 
@@ -467,6 +482,11 @@ class Hub:
         Set ``expectation_sweep_interval=0`` to disable the expectation
         sweeper entirely (tests usually do this to avoid background
         timer noise).
+
+        ``allow_remote_agent_registration=True`` lets wire clients
+        register ``kind="remote_agent"`` identities (owned by the
+        registering connection's agents); by default only in-process
+        callers can.
         """
         hub = cls(
             store,
@@ -476,6 +496,7 @@ class Hub:
             expectation_sweep_interval=expectation_sweep_interval,
             invite_ack_timeout=invite_ack_timeout,
             tracer_provider=tracer_provider,
+            allow_remote_agent_registration=allow_remote_agent_registration,
         )
         if register_default_adapters:
             hub.register_adapter(ConsultingAdapter())
@@ -1128,16 +1149,19 @@ class Hub:
             agent_id = make_id()
             passport.agent_id = agent_id
             passport.created_at = self._clock()
+            # The claim proved the identity at registration; the hub keeps
+            # only the scheme. A remote agent's claim is proxy routing data.
+            stored = passport if passport.effective_kind == "remote_agent" else _without_claim(passport)
 
             effective_rule = rule if rule is not None else Rule()
 
-            await self._persist_passport(passport)
+            await self._persist_passport(stored)
             await self._persist_resume(agent_id, resume)
             await self._persist_rule(agent_id, effective_rule)
             if skill_md is not None:
                 await self._persist_skill(agent_id, skill_md)
 
-            self._passports[agent_id] = passport
+            self._passports[agent_id] = stored
             self._resumes[agent_id] = resume
             self._rules[agent_id] = effective_rule
             if skill_md is not None:
@@ -1155,7 +1179,7 @@ class Hub:
             "on_agent_event",
             agent_id,
             "registered",
-            {"passport": passport, "at": self._clock()},
+            {"passport": stored, "at": self._clock()},
         )
         return passport
 
@@ -2515,9 +2539,9 @@ class Hub:
             # Bind the calling connection to the freshly-stamped identity
             # so dispatched notifies route back to this endpoint.
             self.bind_endpoint(endpoint.endpoint_id, registered.agent_id)
-            return registered.to_dict()
+            return _public_passport(registered)
         if op == "get_agent":
-            return (await self.get_agent(params["name_or_id"])).to_dict()
+            return _public_passport(await self.get_agent(params["name_or_id"]))
         if op == "get_resume":
             return (await self.get_resume(params["agent_id"])).to_dict()
         if op == "get_skill":
@@ -2536,7 +2560,7 @@ class Hub:
                 sort_by=params.get("sort_by"),
                 limit=params.get("limit", 50),
             )
-            return [p.to_dict() for p in agents]
+            return [_public_passport(p) for p in agents]
         if op == "set_resume":
             await self.set_resume(params["agent_id"], Resume.from_dict(params["resume"]))
             return None
@@ -2681,8 +2705,13 @@ class Hub:
         if op in _UNSCOPED_OPS:
             return
         if op == "register":
-            if params["passport"].get("kind") == "remote_agent" and not self._remote_owner_candidates(endpoint):
-                raise AccessDeniedError("registering a remote_agent needs a connection holding an agent of this hub")
+            if params["passport"].get("kind") == "remote_agent":
+                if not self._allow_remote_agent_registration:
+                    raise AccessDeniedError("this hub does not accept remote_agent registration over the wire")
+                if not self._remote_owner_candidates(endpoint):
+                    raise AccessDeniedError(
+                        "registering a remote_agent needs a connection holding an agent of this hub"
+                    )
         elif op in _AGENT_SCOPED_OPS:
             self._require_bound(endpoint, params[_AGENT_SCOPED_OPS[op]])
             if op == "record_observation" and params.get("task_id") is not None:
@@ -2696,6 +2725,12 @@ class Hub:
                 await self._require_checkpoint_writer(endpoint, params["task_id"], claim=op == "checkpoint_task")
         elif op == "post_envelope":
             self._require_bound(endpoint, params["envelope"]["sender_id"])
+            event_type = params["envelope"]["event_type"]
+            if _is_channel_protocol_event(event_type) and event_type not in (
+                EV_CHANNEL_INVITE_ACK,
+                EV_CHANNEL_INVITE_REJECT,
+            ):
+                raise ProtocolError(f"{event_type!r} is emitted only by the hub")
         elif op == "observe_task":
             self._require_bound(endpoint, params["metadata"]["owner_id"])
             if params["metadata"].get("channel_id"):
@@ -3105,6 +3140,10 @@ class Hub:
         if passport_data is None:
             return
         passport = Passport.from_dict(json.loads(passport_data))
+        if passport.effective_kind != "remote_agent" and passport.auth.claim:
+            # Stores written before claims were dropped: forget it on disk too.
+            passport = _without_claim(passport)
+            await self._persist_passport(passport)
         self._passports[agent_id] = passport
         self._name_to_id[passport.name] = agent_id
 

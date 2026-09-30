@@ -52,11 +52,28 @@ existing identity is validated with the scheme that identity registered with; a
 Hello naming another scheme — e.g. `none` in a registry that also holds `NoAuth`
 — is refused with `auth_failed`.
 
+Admission is also only as strong as the secrecy of the claim. The hub does not
+keep an agent's `auth.claim` once registration validated it — adapters check a
+Hello's claim against their own configuration (`ApiKeyAuth` against its keys),
+not against a stored copy — so it is dropped before the passport is cached or
+persisted, and `hydrate` drops and rewrites it in older stores. Passports in
+wire responses (`register`, `get_agent`, `list_agents`) never carry a claim. A
+client re-attaching with `attach` therefore supplies its own passport; the hub
+cannot hand the credential back. (A `remote_agent`'s claim is proxy routing
+data; it stays in-process and is stripped from wire responses too.)
+
 A `kind="remote_agent"` passport is different: its `auth.scheme` is a routing
 label for a `RemoteAgentProxy`, not a credential, so registration never
 validates it. The federation operator normally registers such identities on
 the hub directly (`Hub.register_identity`) and its proxy posts for them
-in-process; they have no connection of their own. Over the wire, therefore:
+in-process; they have no connection of their own. Registration skips auth for
+them, so allowing it over the wire would let any admitted client take an unused
+name that the auth registry could authenticate — a real agent's name — and
+receive the traffic addressed to it. Wire registration of `remote_agent` is
+therefore **off by default** (`Hub(allow_remote_agent_registration=False)`);
+an operator who needs wire clients to register remote agents turns it on,
+accepting that such names are first-come. We preferred this over namespacing
+remote names, which would change every federated agent's name. When enabled:
 
 - registering a `remote_agent` needs a connection that already holds a
   non-remote agent of this hub. Those agents become its **owners**, persisted
@@ -73,6 +90,11 @@ Every task id a wire request names (`task_id`, `metadata.task_id`,
 `envelope.task_id`) must be one path segment — `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`,
 which covers `uuid4().hex` and ids like `task-1` — because task ids become
 store paths. Anything else is a `ProtocolError`.
+
+Over the wire, `ag2.channel.*` events other than `invite.ack` / `invite.reject`
+(invite, opened, closed, expired) are emitted only by the hub and rejected from
+clients: they drive the channel state machine and clients (e.g. `delegate`)
+treat `closed` as terminal, so a forged one ends waits early.
 
 Independently of the connection, `post_envelope` accepts events only from the
 channel's participants, in the hub rather than per adapter, so an adapter that
