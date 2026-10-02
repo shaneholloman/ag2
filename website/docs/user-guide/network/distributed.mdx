@@ -58,7 +58,7 @@ asyncio.run(main())
 
 ## Connecting a Remote Agent
 
-From any other process — same machine, different container, or across a real network:
+From any other process — same machine, different container, or across a real network. The example connects to `ws://hub-host:8765`; reaching a hub from another machine needs it bound to a reachable address with real authentication (see the warning above), while on one machine you can use `ws://127.0.0.1:8765`:
 
 ```python linenums="1"
 import asyncio
@@ -211,7 +211,7 @@ recovered = await agent.resume_from(task_id, checkpoint_store)
 | Concern | Recommendation |
 |---|---|
 | TLS | Pass an `ssl_context` to `serve_ws(...)` and use `wss://` in `WsLink`. |
-| Auth | Build the hub with `AuthRegistry([ApiKeyAuth(keys=...)])` and pass `Passport(auth=AuthBlock(...))` from each agent. |
+| Auth | Required beyond loopback: `serve_ws` refuses a hub with `NoAuth` there. Build the hub with `AuthRegistry([ApiKeyAuth(keys=...)])` and pass `Passport(auth=AuthBlock(...))` from each agent. |
 | Durability | Use `DiskKnowledgeStore(path)` on the hub so the registry and channel WALs survive a restart. |
 | Reconnect | On disconnect, build a fresh `HubClient`, call `open()`, then `attach(agent, name=..., since_envelope_id=last_id)`. The hub replays any unacked envelopes past that cursor. |
 | Federation | Register a `RemoteAgentProxy` on the hub to route envelopes addressed to agents with `kind="remote_agent"` across hub boundaries. |
