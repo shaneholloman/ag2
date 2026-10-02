@@ -137,10 +137,12 @@ class _TaskEvents(BaseHubListener):
 
 
 @asynccontextmanager
-async def _serve(*, allow_no_auth: bool = False, allow_remote_agents: bool = False) -> AsyncGenerator[tuple[Hub, str]]:
+async def _serve(
+    *, allow_no_auth: bool = False, allow_remote_agents: bool = False, store: MemoryKnowledgeStore | None = None
+) -> AsyncGenerator[tuple[Hub, str]]:
     api_key = ApiKeyAuth(keys={name: f"k-{name}" for name in _NAMES})
     hub = await Hub.open(
-        MemoryKnowledgeStore(),
+        store if store is not None else MemoryKnowledgeStore(),
         auth=AuthRegistry([NoAuth(), api_key] if allow_no_auth else [api_key]),
         ttl_sweep_interval=0,
         expectation_sweep_interval=0,
@@ -433,7 +435,8 @@ class TestChannelScope:
                 await mallory_hc.close()
 
     async def test_task_id_that_is_not_a_single_path_segment_is_refused(self) -> None:
-        async with _serve() as (hub, url):
+        store = MemoryKnowledgeStore()
+        async with _serve(store=store) as (_, url):
             bob_hc = HubClient(WsLink(url))
             try:
                 await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
@@ -441,7 +444,7 @@ class TestChannelScope:
                 with pytest.raises(ProtocolError, match="invalid task_id"):
                     await bob_hc.checkpoint_task("../agents/x", {"step": 1})
 
-                assert await hub._store.read("/agents/x/checkpoint.json") is None
+                assert await store.read("/agents/x/checkpoint.json") is None
             finally:
                 await bob_hc.close()
 
@@ -747,22 +750,23 @@ class TestCredentials:
                 await mallory_hc.close()
 
     async def test_claim_is_not_kept_in_the_store(self) -> None:
-        async with _serve() as (hub, url):
+        store = MemoryKnowledgeStore()
+        async with _serve(store=store) as (hub, url):
             bob_hc = HubClient(WsLink(url))
             try:
                 bob = await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
                 assert bob.agent_id is not None
-                assert "k-bob" not in (await hub._store.read(passport_path(bob.agent_id)) or "")
+                assert "k-bob" not in (await store.read(passport_path(bob.agent_id)) or "")
 
                 # A store written before claims were dropped is cleaned on hydrate.
                 legacy = await hub.get_agent(bob.agent_id)
                 legacy_dict = legacy.to_dict()
                 legacy_dict["auth"]["claim"] = {"token": "k-bob"}
-                await hub._store.write(passport_path(bob.agent_id), json.dumps(legacy_dict))
+                await store.write(passport_path(bob.agent_id), json.dumps(legacy_dict))
                 await hub.hydrate()
 
                 assert (await hub.get_agent(bob.agent_id)).auth.claim == {}
-                assert "k-bob" not in (await hub._store.read(passport_path(bob.agent_id)) or "")
+                assert "k-bob" not in (await store.read(passport_path(bob.agent_id)) or "")
             finally:
                 await bob_hc.close()
 
@@ -812,7 +816,7 @@ class TestTaskEvents:
                 await unbound_hc.close()
 
     async def test_mirror_failed_for_an_id_checkpointed_by_another_agent_is_denied(self) -> None:
-        async with _serve() as (hub, url):
+        async with _serve() as (_, url):
             bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
             try:
                 await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
@@ -826,7 +830,7 @@ class TestTaskEvents:
                 await mallory_hc.close()
 
     async def test_concurrent_first_checkpoints_leave_one_writer(self) -> None:
-        async with _serve() as (hub, url):
+        async with _serve() as (_, url):
             bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
             try:
                 await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
