@@ -13,12 +13,13 @@ key and tries to act as, or read the private state of, bob.
 import asyncio
 import dataclasses
 import json
+import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 import pytest
 
-from ag2 import Agent
+from ag2 import Agent, Context
 from ag2.knowledge import MemoryKnowledgeStore
 from ag2.network import (
     EV_CHANNEL_CLOSED,
@@ -39,20 +40,24 @@ from ag2.network import (
     HelloFrame,
     Hub,
     HubClient,
+    LimitsBlock,
     NoAuth,
+    NotFoundError,
     Passport,
     PingFrame,
     PongFrame,
     ProtocolError,
     ReceiptFrame,
     Resume,
+    Rule,
     WsLink,
     WsLinkClient,
     serve_ws,
 )
 from ag2.network.hub.layout import passport_path
 from ag2.network.task_mirror import TaskMirror
-from ag2.task import TaskMetadata, TaskSpec, TaskState
+from ag2.stream import MemoryStream
+from ag2.task import TaskMetadata, TaskSpec, TaskStarted, TaskState
 
 from ._helpers import ScriptedConfig
 
@@ -148,8 +153,8 @@ async def _serve(*, allow_no_auth: bool = False, allow_remote_agents: bool = Fal
         await hub.close()
 
 
+@pytest.mark.asyncio
 class TestActingAsAnotherAgent:
-    @pytest.mark.asyncio
     async def test_connection_acts_as_each_agent_it_registered_and_no_other(self) -> None:
         async with _serve() as (hub, url):
             shared_hc, bob_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
@@ -169,7 +174,6 @@ class TestActingAsAnotherAgent:
                 await shared_hc.close()
                 await bob_hc.close()
 
-    @pytest.mark.asyncio
     async def test_post_envelope_as_another_agent_is_denied(self) -> None:
         async with _serve() as (hub, url):
             alice_hc, bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url)), HubClient(WsLink(url))
@@ -197,7 +201,6 @@ class TestActingAsAnotherAgent:
                 await bob_hc.close()
                 await mallory_hc.close()
 
-    @pytest.mark.asyncio
     async def test_update_of_another_agents_task_is_denied(self) -> None:
         async with _serve() as (hub, url):
             bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
@@ -218,7 +221,6 @@ class TestActingAsAnotherAgent:
                 await bob_hc.close()
                 await mallory_hc.close()
 
-    @pytest.mark.asyncio
     async def test_receipt_for_another_agent_does_not_advance_its_cursor(self) -> None:
         async with _serve() as (hub, url):
             mallory_hc = HubClient(WsLink(url))
@@ -241,7 +243,6 @@ class TestActingAsAnotherAgent:
             finally:
                 await mallory_hc.close()
 
-    @pytest.mark.asyncio
     async def test_checkpoint_of_an_unobserved_task_belongs_to_its_first_writer(self) -> None:
         async with _serve() as (_, url):
             bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
@@ -260,7 +261,6 @@ class TestActingAsAnotherAgent:
                 await bob_hc.close()
                 await mallory_hc.close()
 
-    @pytest.mark.asyncio
     async def test_observing_a_task_id_checkpointed_by_another_agent_is_denied(self) -> None:
         async with _serve() as (_, url):
             bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
@@ -285,8 +285,8 @@ class TestActingAsAnotherAgent:
                 await mallory_hc.close()
 
 
+@pytest.mark.asyncio
 class TestChannelScope:
-    @pytest.mark.asyncio
     async def test_only_participants_read_the_channel_wal(self) -> None:
         async with _serve() as (_, url):
             alice_hc, bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url)), HubClient(WsLink(url))
@@ -304,7 +304,6 @@ class TestChannelScope:
                 await bob_hc.close()
                 await mallory_hc.close()
 
-    @pytest.mark.asyncio
     async def test_list_channels_without_agent_lists_only_the_connections_channels(self) -> None:
         async with _serve() as (_, url):
             alice_hc, bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url)), HubClient(WsLink(url))
@@ -321,7 +320,6 @@ class TestChannelScope:
                 await bob_hc.close()
                 await mallory_hc.close()
 
-    @pytest.mark.asyncio
     async def test_non_participant_content_is_refused_whatever_the_adapter_accepts(self) -> None:
         # The conversation adapter accepts non-text events from anyone.
         async with _serve() as (hub, url):
@@ -349,7 +347,6 @@ class TestChannelScope:
                 await bob_hc.close()
                 await mallory_hc.close()
 
-    @pytest.mark.asyncio
     async def test_non_participant_protocol_event_is_refused(self) -> None:
         async with _serve() as (hub, url):
             alice_hc, bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url)), HubClient(WsLink(url))
@@ -377,7 +374,6 @@ class TestChannelScope:
                 await bob_hc.close()
                 await mallory_hc.close()
 
-    @pytest.mark.asyncio
     async def test_non_participant_invite_reject_leaves_the_channel_pending(self) -> None:
         async with _serve() as (hub, url):
             alice_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
@@ -412,7 +408,6 @@ class TestChannelScope:
                 await alice_hc.close()
                 await mallory_hc.close()
 
-    @pytest.mark.asyncio
     async def test_observing_a_task_onto_a_foreign_channel_is_denied(self) -> None:
         async with _serve() as (_, url):
             alice_hc, bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url)), HubClient(WsLink(url))
@@ -437,7 +432,6 @@ class TestChannelScope:
                 await bob_hc.close()
                 await mallory_hc.close()
 
-    @pytest.mark.asyncio
     async def test_task_id_that_is_not_a_single_path_segment_is_refused(self) -> None:
         async with _serve() as (hub, url):
             bob_hc = HubClient(WsLink(url))
@@ -452,8 +446,8 @@ class TestChannelScope:
                 await bob_hc.close()
 
 
+@pytest.mark.asyncio
 class TestPeerCancelRequest:
-    @pytest.mark.asyncio
     async def test_outsider_sends_one_cancel_request_per_task(self) -> None:
         async with _serve() as (hub, url):
             alice_hc, bob_hc, carol_hc = HubClient(WsLink(url)), HubClient(WsLink(url)), HubClient(WsLink(url))
@@ -491,7 +485,6 @@ class TestPeerCancelRequest:
                 await bob_hc.close()
                 await carol_hc.close()
 
-    @pytest.mark.asyncio
     async def test_repeat_cancel_is_refused_without_reading_the_wal_even_after_hydrate(self) -> None:
         store = _WalReadCountingStore()
         hub, _, request = await _hub_with_live_task(store)
@@ -507,7 +500,6 @@ class TestPeerCancelRequest:
         finally:
             await hub.close()
 
-    @pytest.mark.asyncio
     async def test_concurrent_duplicate_cancels_accept_exactly_one(self) -> None:
         hub, channel_id, request = await _hub_with_live_task(_WalReadCountingStore())
         try:
@@ -523,7 +515,6 @@ class TestPeerCancelRequest:
         finally:
             await hub.close()
 
-    @pytest.mark.asyncio
     async def test_outsider_cancel_request_for_the_owners_task_is_accepted(self) -> None:
         async with _serve() as (hub, url):
             alice_hc, bob_hc, carol_hc = HubClient(WsLink(url)), HubClient(WsLink(url)), HubClient(WsLink(url))
@@ -561,7 +552,6 @@ class TestPeerCancelRequest:
                 await bob_hc.close()
                 await carol_hc.close()
 
-    @pytest.mark.asyncio
     async def test_outsider_cancel_request_not_shaped_as_the_tasks_tool_sends_it_is_refused(self) -> None:
         async with _serve() as (hub, url):
             alice_hc, bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url)), HubClient(WsLink(url))
@@ -608,8 +598,8 @@ class TestPeerCancelRequest:
                 await mallory_hc.close()
 
 
+@pytest.mark.asyncio
 class TestReattach:
-    @pytest.mark.asyncio
     async def test_hello_with_a_non_object_claim_is_refused(self) -> None:
         async with _serve() as (_, url):
             bob_hc = HubClient(WsLink(url))
@@ -627,7 +617,6 @@ class TestReattach:
                 await bob_hc.close()
                 await link.close()
 
-    @pytest.mark.asyncio
     async def test_reattach_moves_the_identity_to_the_new_connection(self) -> None:
         async with _serve() as (hub, url):
             old_hc, new_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
@@ -644,7 +633,6 @@ class TestReattach:
                 await old_hc.close()
                 await new_hc.close()
 
-    @pytest.mark.asyncio
     async def test_hello_with_a_scheme_other_than_the_registered_one_is_refused(self) -> None:
         async with _serve(allow_no_auth=True) as (_, url):
             bob_hc = HubClient(WsLink(url))
@@ -663,8 +651,8 @@ class TestReattach:
                 await mallory_link.close()
 
 
+@pytest.mark.asyncio
 class TestRemoteAgent:
-    @pytest.mark.asyncio
     async def test_wire_remote_agent_registration_is_off_by_default(self) -> None:
         async with _serve() as (_, url):
             mallory_hc, carol_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
@@ -685,7 +673,6 @@ class TestRemoteAgent:
                 await mallory_hc.close()
                 await carol_hc.close()
 
-    @pytest.mark.asyncio
     async def test_connection_without_an_agent_cannot_register_a_remote_agent(self) -> None:
         async with _serve(allow_no_auth=True, allow_remote_agents=True) as (hub, url):
             keyless_hc = HubClient(WsLink(url))
@@ -699,7 +686,6 @@ class TestRemoteAgent:
             finally:
                 await keyless_hc.close()
 
-    @pytest.mark.asyncio
     async def test_hello_as_a_remote_agent_without_its_owner_is_refused(self) -> None:
         async with _serve(allow_no_auth=True, allow_remote_agents=True) as (_, url):
             owner_hc = HubClient(WsLink(url))
@@ -720,7 +706,6 @@ class TestRemoteAgent:
                 await owner_hc.close()
                 await keyless_link.close()
 
-    @pytest.mark.asyncio
     async def test_owner_reattaches_its_remote_agent_on_a_new_connection(self) -> None:
         async with _serve(allow_no_auth=True, allow_remote_agents=True) as (hub, url):
             first_hc, second_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
@@ -745,8 +730,8 @@ class TestRemoteAgent:
                 await second_hc.close()
 
 
+@pytest.mark.asyncio
 class TestCredentials:
-    @pytest.mark.asyncio
     async def test_passports_read_over_the_wire_carry_no_claim(self) -> None:
         async with _serve() as (_, url):
             bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
@@ -761,7 +746,6 @@ class TestCredentials:
                 await bob_hc.close()
                 await mallory_hc.close()
 
-    @pytest.mark.asyncio
     async def test_claim_is_not_kept_in_the_store(self) -> None:
         async with _serve() as (hub, url):
             bob_hc = HubClient(WsLink(url))
@@ -783,35 +767,34 @@ class TestCredentials:
                 await bob_hc.close()
 
 
-class TestHubOnlyEvents:
-    @pytest.mark.asyncio
-    async def test_participant_cannot_post_a_hub_only_channel_event(self) -> None:
-        async with _serve() as (hub, url):
-            alice_hc, bob_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
-            try:
-                alice = await alice_hc.register(_agent("alice"), _passport("alice"), Resume())
-                bob = await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
-                channel = await alice.open(type="conversation", target="bob")
+@pytest.mark.asyncio
+async def test_participant_cannot_post_a_hub_only_channel_event() -> None:
+    async with _serve() as (hub, url):
+        alice_hc, bob_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
+        try:
+            alice = await alice_hc.register(_agent("alice"), _passport("alice"), Resume())
+            bob = await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
+            channel = await alice.open(type="conversation", target="bob")
 
-                with pytest.raises(ProtocolError, match="emitted only by the hub"):
-                    await bob_hc.post_envelope(
-                        Envelope(
-                            channel_id=channel.channel_id,
-                            sender_id=bob.agent_id,
-                            audience=None,
-                            event_type=EV_CHANNEL_CLOSED,
-                            event_data={"channel_id": channel.channel_id, "reason": "fake"},
-                        )
+            with pytest.raises(ProtocolError, match="emitted only by the hub"):
+                await bob_hc.post_envelope(
+                    Envelope(
+                        channel_id=channel.channel_id,
+                        sender_id=bob.agent_id,
+                        audience=None,
+                        event_type=EV_CHANNEL_CLOSED,
+                        event_data={"channel_id": channel.channel_id, "reason": "fake"},
                     )
+                )
 
-                assert (await hub.get_channel(channel.channel_id)).state == ChannelState.ACTIVE
-            finally:
-                await alice_hc.close()
-                await bob_hc.close()
+            assert (await hub.get_channel(channel.channel_id)).state == ChannelState.ACTIVE
+        finally:
+            await alice_hc.close()
+            await bob_hc.close()
 
 
+@pytest.mark.asyncio
 class TestTaskEvents:
-    @pytest.mark.asyncio
     async def test_connection_without_an_agent_cannot_fire_task_events(self) -> None:
         async with _serve() as (hub, url):
             bob_hc, unbound_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
@@ -828,7 +811,38 @@ class TestTaskEvents:
                 await bob_hc.close()
                 await unbound_hc.close()
 
-    @pytest.mark.asyncio
+    async def test_mirror_failed_for_an_id_checkpointed_by_another_agent_is_denied(self) -> None:
+        async with _serve() as (hub, url):
+            bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
+            try:
+                await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
+                mallory = await mallory_hc.register(_agent("mallory"), _passport("mallory"), Resume())
+                await bob_hc.checkpoint_task("t-bob", {"step": 1})
+
+                with pytest.raises(AccessDeniedError):
+                    await mallory_hc.fire_task_event("t-bob", "mirror_failed", {"owner_id": mallory.agent_id})
+            finally:
+                await bob_hc.close()
+                await mallory_hc.close()
+
+    async def test_concurrent_first_checkpoints_leave_one_writer(self) -> None:
+        async with _serve() as (hub, url):
+            bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
+            try:
+                await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
+                await mallory_hc.register(_agent("mallory"), _passport("mallory"), Resume())
+
+                results = await asyncio.gather(
+                    bob_hc.checkpoint_task("t-race", {"by": "bob"}),
+                    mallory_hc.checkpoint_task("t-race", {"by": "mallory"}),
+                    return_exceptions=True,
+                )
+
+                assert sum(isinstance(r, AccessDeniedError) for r in results) == 1
+            finally:
+                await bob_hc.close()
+                await mallory_hc.close()
+
     async def test_agent_cannot_forge_task_events_for_unobserved_tasks_or_other_owners(self) -> None:
         async with _serve() as (hub, url):
             bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
@@ -847,7 +861,6 @@ class TestTaskEvents:
                 await bob_hc.close()
                 await mallory_hc.close()
 
-    @pytest.mark.asyncio
     async def test_mirror_failure_naming_a_foreign_channel_or_extra_fields_is_refused(self) -> None:
         async with _serve() as (hub, url):
             alice_hc, bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url)), HubClient(WsLink(url))
@@ -872,7 +885,6 @@ class TestTaskEvents:
                 await bob_hc.close()
                 await mallory_hc.close()
 
-    @pytest.mark.asyncio
     async def test_terminal_task_event_for_an_observed_task_is_refused(self) -> None:
         async with _serve() as (hub, url):
             mallory_hc = HubClient(WsLink(url))
@@ -892,7 +904,6 @@ class TestTaskEvents:
             finally:
                 await mallory_hc.close()
 
-    @pytest.mark.asyncio
     async def test_task_mirror_reports_its_failure_over_the_wire(self) -> None:
         async with _serve() as (hub, url):
             alice_hc, bob_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
@@ -900,21 +911,26 @@ class TestTaskEvents:
             listener = _TaskEvents(fired)
             hub.register_listener(listener)
             try:
-                alice = await alice_hc.register(_agent("alice"), _passport("alice"), Resume())
+                alice = await alice_hc.register(
+                    _agent("alice"),
+                    _passport("alice"),
+                    Resume(),
+                    rule=Rule(limits=LimitsBlock(max_concurrent_tasks=1)),
+                )
                 await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
                 channel = await alice.open(type="conversation", target="bob")
-                mirror = TaskMirror(hub_client=alice_hc, owner_id=alice.agent_id, channel_id=channel.channel_id)
+                stream = MemoryStream()
+                TaskMirror(hub_client=alice_hc, owner_id=alice.agent_id, channel_id=channel.channel_id).attach(stream)
 
-                await mirror._escalate("t-alice", "observe", RuntimeError("store down"))
+                # The second task exceeds alice's cap, so the hub refuses to observe it.
+                await stream.send(TaskStarted(task_id="t-1", objective="first"), Context(stream=stream))
+                await stream.send(TaskStarted(task_id="t-2", objective="second"), Context(stream=stream))
 
-                assert [(t, k, p["channel_id"]) for t, k, p in fired] == [
-                    ("t-alice", "mirror_failed", channel.channel_id)
-                ]
+                assert [(t, k, p["channel_id"]) for t, k, p in fired] == [("t-2", "mirror_failed", channel.channel_id)]
             finally:
                 await alice_hc.close()
                 await bob_hc.close()
 
-    @pytest.mark.asyncio
     async def test_observation_recorded_by_another_agent_does_not_suppress_the_owners(self) -> None:
         async with _serve() as (hub, url):
             bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
@@ -940,50 +956,174 @@ class TestTaskEvents:
                 await mallory_hc.close()
 
 
-class TestNames:
-    @pytest.mark.asyncio
-    async def test_a_name_cannot_shadow_an_agent_id(self) -> None:
-        async with _serve(allow_no_auth=True) as (hub, url):
-            bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
+@pytest.mark.asyncio
+async def test_a_name_cannot_shadow_an_agent_id() -> None:
+    async with _serve(allow_no_auth=True) as (hub, url):
+        bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
+        try:
+            bob = await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
+            assert bob.agent_id is not None
+
+            with pytest.raises(ProtocolError, match="agent id"):
+                await mallory_hc.register(_agent("shadow"), Passport(name=bob.agent_id), Resume())
+
+            assert (await mallory_hc.get_agent(bob.agent_id)).name == "bob"
+        finally:
+            await bob_hc.close()
+            await mallory_hc.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "frame",
+    [
+        HelloFrame(name=["bob"]),  # type: ignore[arg-type]
+        HelloFrame(name="bob", since_envelope_id=5),  # type: ignore[arg-type]
+        ReceiptFrame(envelope_id="e-1", status="ack", recipient_id=["bob"], channel_id="c-1"),  # type: ignore[arg-type]
+    ],
+    ids=["hello-name-list", "hello-since-int", "receipt-recipient-list"],
+)
+async def test_malformed_frame_gets_an_error_and_keeps_the_connection(frame: object) -> None:
+    async with _serve(allow_no_auth=True) as (hub, url):
+        await hub.register_identity(Passport(name="bob"), Resume())
+        link = WsLinkClient(url)
+        try:
+            await link.open()
+            frames = aiter(link.frames())
+
+            await link.send_frame(frame)  # type: ignore[arg-type]
+            reply = await asyncio.wait_for(anext(frames), 2.0)
+            await link.send_frame(PingFrame())
+            pong = await asyncio.wait_for(anext(frames), 2.0)
+
+            assert isinstance(reply, ErrorFrame)
+            assert reply.code == "protocol_error"
+            assert isinstance(pong, PongFrame)
+        finally:
+            await link.close()
+
+
+@pytest.mark.asyncio
+class TestResidualExposure:
+    """Reads and writes a participant-free or channel-free caller used to reach."""
+
+    async def test_task_is_visible_to_its_owner_and_channel_participants_only(self) -> None:
+        async with _serve() as (hub, url):
+            alice_hc, bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url)), HubClient(WsLink(url))
             try:
+                alice = await alice_hc.register(_agent("alice"), _passport("alice"), Resume())
                 bob = await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
-                assert bob.agent_id is not None
+                await mallory_hc.register(_agent("mallory"), _passport("mallory"), Resume())
+                channel = await alice.open(type="conversation", target="bob")
+                await bob_hc.observe_task(
+                    TaskMetadata(
+                        task_id="t-bob",
+                        owner_id=bob.agent_id,
+                        spec=TaskSpec(title="secret"),
+                        state=TaskState.RUNNING,
+                        channel_id=channel.channel_id,
+                    )
+                )
 
-                with pytest.raises(ProtocolError, match="agent id"):
-                    await mallory_hc.register(_agent("shadow"), Passport(name=bob.agent_id), Resume())
-
-                assert (await mallory_hc.get_agent(bob.agent_id)).name == "bob"
+                assert (await bob_hc.get_task("t-bob")).task_id == "t-bob"
+                assert (await alice_hc.get_task("t-bob")).spec.title == "secret"
+                assert [t.task_id for t in await alice_hc.list_tasks()] == ["t-bob"]
+                with pytest.raises(NotFoundError):
+                    await mallory_hc.get_task("t-bob")
+                assert await mallory_hc.list_tasks() == []
+                assert await mallory_hc.list_tasks(channel_id=channel.channel_id) == []
             finally:
+                await alice_hc.close()
                 await bob_hc.close()
                 await mallory_hc.close()
 
-
-class TestMalformedFrames:
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "frame",
-        [
-            HelloFrame(name=["bob"]),  # type: ignore[arg-type]
-            HelloFrame(name="bob", since_envelope_id=5),  # type: ignore[arg-type]
-            ReceiptFrame(envelope_id="e-1", status="ack", recipient_id=["bob"], channel_id="c-1"),  # type: ignore[arg-type]
-        ],
-        ids=["hello-name-list", "hello-since-int", "receipt-recipient-list"],
-    )
-    async def test_malformed_frame_gets_an_error_and_keeps_the_connection(self, frame: object) -> None:
-        async with _serve(allow_no_auth=True) as (hub, url):
-            await hub.register_identity(Passport(name="bob"), Resume())
-            link = WsLinkClient(url)
+    async def test_envelope_addressed_to_a_non_participant_is_refused(self) -> None:
+        async with _serve() as (hub, url):
+            alice_hc, bob_hc, carol_hc = HubClient(WsLink(url)), HubClient(WsLink(url)), HubClient(WsLink(url))
             try:
-                await link.open()
-                frames = aiter(link.frames())
+                alice = await alice_hc.register(_agent("alice"), _passport("alice"), Resume())
+                await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
+                carol = await carol_hc.register(_agent("carol"), _passport("carol"), Resume())
+                channel = await alice.open(type="conversation", target="bob")
 
-                await link.send_frame(frame)  # type: ignore[arg-type]
-                reply = await asyncio.wait_for(anext(frames), 2.0)
-                await link.send_frame(PingFrame())
-                pong = await asyncio.wait_for(anext(frames), 2.0)
-
-                assert isinstance(reply, ErrorFrame)
-                assert reply.code == "protocol_error"
-                assert isinstance(pong, PongFrame)
+                with pytest.raises(ProtocolError):
+                    await alice_hc.post_envelope(
+                        Envelope(
+                            channel_id=channel.channel_id,
+                            sender_id=alice.agent_id,
+                            audience=[carol.agent_id],
+                            event_type=EV_TEXT,
+                            event_data={"text": "hi carol"},
+                        )
+                    )
             finally:
-                await link.close()
+                await alice_hc.close()
+                await bob_hc.close()
+                await carol_hc.close()
+
+    async def test_turn_failure_for_a_channel_the_agent_is_not_in_is_refused(self) -> None:
+        async with _serve() as (hub, url):
+            alice_hc, bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url)), HubClient(WsLink(url))
+            try:
+                alice = await alice_hc.register(_agent("alice"), _passport("alice"), Resume())
+                await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
+                mallory = await mallory_hc.register(_agent("mallory"), _passport("mallory"), Resume())
+                channel = await alice.open(type="conversation", target="bob")
+
+                with pytest.raises(AccessDeniedError):
+                    await mallory_hc.report_turn_failure(
+                        channel_id=channel.channel_id,
+                        agent_id=mallory.agent_id,
+                        envelope_id="e-1",
+                        exc=RuntimeError("forged"),
+                    )
+            finally:
+                await alice_hc.close()
+                await bob_hc.close()
+                await mallory_hc.close()
+
+    async def test_peer_cancel_reason_over_the_length_limit_is_refused(self) -> None:
+        hub, _, request = await _hub_with_live_task(MemoryKnowledgeStore())
+        try:
+            request.event_data["reason"] = "x" * 501
+            with pytest.raises(ProtocolError):
+                await hub.post_envelope(request)
+        finally:
+            await hub.close()
+
+    async def test_mirror_failure_text_is_clipped(self) -> None:
+        async with _serve() as (hub, url):
+            alice_hc = HubClient(WsLink(url))
+            fired: list[tuple[str, str, dict]] = []
+            hub.register_listener(_TaskEvents(fired))
+            try:
+                alice = await alice_hc.register(_agent("alice"), _passport("alice"), Resume())
+                await alice_hc.fire_task_event(
+                    "t-alice", "mirror_failed", {"owner_id": alice.agent_id, "exc_message": "x" * 5000}
+                )
+
+                assert fired == [("t-alice", "mirror_failed", {"owner_id": alice.agent_id, "exc_message": "x" * 500})]
+            finally:
+                await alice_hc.close()
+
+    async def test_serving_no_auth_beyond_loopback_is_refused_unless_allowed(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        hub = await Hub.open(MemoryKnowledgeStore(), ttl_sweep_interval=0, expectation_sweep_interval=0)
+        try:
+            with pytest.raises(ValueError, match="'none' auth scheme"):
+                async with serve_ws(hub, "0.0.0.0", 0):
+                    pass
+
+            with caplog.at_level(logging.WARNING, logger="ag2.network.transport.ws"):
+                async with serve_ws(hub, "0.0.0.0", 0, allow_unauthenticated=True):
+                    pass
+            assert "accepts the 'none' auth scheme" in caplog.text
+
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="ag2.network.transport.ws"):
+                async with serve_ws(hub, "127.0.0.1", 0):
+                    pass
+            assert caplog.text == ""
+        finally:
+            await hub.close()

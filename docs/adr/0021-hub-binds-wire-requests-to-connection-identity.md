@@ -28,7 +28,8 @@ their signatures and stay unchecked.
 `Hub._authorize_request` classifies each op:
 
 - **Unscoped** — `register` and discovery reads (agents, resumes, skills,
-  rules, tasks). A fresh connection runs these before its `HelloFrame`.
+  rules). A fresh connection runs these before its `HelloFrame`. `get_task` /
+  `list_tasks` are filtered to the tasks the connection may see.
 - **Agent-scoped** — the named agent must be bound: identity mutation,
   `unregister`, `create_channel`, `can_send`, `pending_turns_for`,
   `report_turn_failure`, `record_observation`, the `sender_id` of
@@ -104,7 +105,7 @@ itself from `update_task`. So over the wire the only task event accepted is the
 bound and, for an observed task, be that task's owner with the task's own
 channel; for an unobserved task any `channel_id` must be one the owner
 participates in. Telemetry still records `mirror_failed` as a failed task span.
-Its owner is always the reporting agent; for an observed task it carries that
+For an unobserved task id whose checkpoint another connection wrote, the report is denied like any other access to that checkpoint. Its owner is always the reporting agent; for an observed task it carries that
 task's own id and channel, while for an unobserved task it carries whatever
 pattern-valid task id the reporter names and either no channel or one the
 reporter is in.
@@ -161,11 +162,26 @@ participant of the task's `channel_id`.
   so filtering by audience would diverge it from the hub's fold.
 - Re-attaching an agent from a new connection moves its authority there; the old
   connection's late requests and receipts for it are rejected or dropped.
-- Task records are hub-wide reads: any admitted connection sees every task's
-  spec, state, progress and result through `get_task` / `list_tasks`. This is
-  intended — delegators poll and wait on tasks other agents own, and the tasks
-  tool's `scope="all"` lists across owners — so agents must not put anything in
-  a task spec or result that other agents on the hub may not read.
+- Task records are visible over the wire only to the task's owner and to the
+  participants of its channel: `get_task` answers `not_found` for any other
+  task, and `list_tasks` leaves them out. A delegator polls the tasks it
+  delegated because it shares their channel; `scope="all"` lists what the
+  connection may see, not every task on the hub. A task with no channel is
+  visible to its owner alone.
+- A wire envelope's `audience` may name only participants of its channel, and
+  a peer cancel request's `reason` is at most 500 characters, as is the free
+  text of a `mirror_failed` payload (longer is clipped). `report_turn_failure`
+  needs the named agent to participate in the channel.
 - A checkpoint written only in-process (or before writers were recorded) has no
   recorded writer: any connection with a bound agent can read it, and the first
   one to write it over the wire claims it.
+- Recording a checkpoint's first writer is serialised by a hub lock, so two
+  connections racing to checkpoint the same new id cannot both claim it.
+  Squatting stays: an id nobody has checkpointed yet goes to whoever writes it
+  first.
+- `get_resume` and `get_skill` are discovery reads (the `peers` tool uses
+  them), and `get_rule` is read by `attach` before the Hello, so none is
+  scoped to a bound agent.
+- A registry holding `NoAuth` admits any client as any agent, so `serve_ws`
+  raises `ValueError` for such a hub on a non-loopback host. Operators who
+  accept that pass `allow_unauthenticated=True`, which logs a warning instead.

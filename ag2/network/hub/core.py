@@ -266,6 +266,11 @@ def _expires_at(now_iso: str, ttl_seconds: int) -> str:
 # human-readable ids like ``task-1`` fit.
 _TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
+# Longest free-text field (a peer cancel ``reason``, a ``mirror_failed``
+# message) a wire client may place in front of another agent or the audit
+# log.
+_MAX_WIRE_TEXT = 500
+
 # Payload keys of ``TaskMirror``'s ``mirror_failed`` report — the only task
 # event a wire client may fire.
 _MIRROR_FAILURE_KEYS: frozenset[str] = frozenset({"op", "owner_id", "channel_id", "exc_type", "exc_message"})
@@ -274,7 +279,9 @@ _MIRROR_FAILURE_KEYS: frozenset[str] = frozenset({"op", "owner_id", "channel_id"
 # be mistaken for another agent's id, so none may be registered.
 _AGENT_ID_RE = re.compile(r"[0-9a-f]{32}")
 
-# Ops open to any connection: hub-wide discovery reads. ``register`` is
+# Ops open to any connection: hub-wide discovery reads. Task records are
+# not among them: ``get_task`` / ``list_tasks`` show a task only to its
+# owner and to the participants of its channel (``Hub._task_visible``). ``register`` is
 # open too, except that a ``remote_agent`` needs an owner (see
 # ``Hub._authorize_request``).
 _UNSCOPED_OPS: frozenset[str] = frozenset({
@@ -285,8 +292,6 @@ _UNSCOPED_OPS: frozenset[str] = frozenset({
     "find_agent_id",
     "names_for",
     "list_agents",
-    "get_task",
-    "list_tasks",
 })
 
 # Ops that act as, or read the private state of, the agent named by the
@@ -483,6 +488,8 @@ class Hub:
         # Per-channel locks for WAL append + dispatch ordering.
         self._channel_locks: dict[str, asyncio.Lock] = {}
         self._registration_lock = asyncio.Lock()
+        # Serialises the read-then-write that records a checkpoint's first writer.
+        self._checkpoint_claim_lock = asyncio.Lock()
 
         self._ttl_sweeper: _IntervalSweeper | None = None
         self._expectation_sweeper: _IntervalSweeper | None = None
@@ -799,6 +806,11 @@ class Hub:
         recognised values, but tenants may emit additional kinds.
         """
         await self._fan_out("on_task_event", task_id, kind, payload)
+
+    @property
+    def auth_schemes(self) -> list[str]:
+        """Auth schemes this hub accepts at registration and re-attach."""
+        return self._auth.schemes()
 
     @property
     def audit_log(self) -> AuditLog:
@@ -2227,6 +2239,7 @@ class Hub:
             and set(envelope.event_data) == {"task_id", "reason"}
             and envelope.event_data["task_id"] == envelope.task_id
             and isinstance(envelope.event_data["reason"], str)
+            and len(envelope.event_data["reason"]) <= _MAX_WIRE_TEXT
         )
 
     # ── Endpoint management ─────────────────────────────────────────────────
@@ -2714,9 +2727,10 @@ class Hub:
                 agent_id=params.get("agent_id"),
                 channel_id=params.get("channel_id"),
                 state=state,
-                limit=params.get("limit", 50),
+                limit=max(len(self._tasks), 1),
             )
-            return [t.to_dict() for t in tasks]
+            visible = [t for t in tasks if self._task_visible(endpoint, t)]
+            return [t.to_dict() for t in visible[: params.get("limit", 50)]]
         if op == "observe_task":
             await self.observe_task(TaskMetadata.from_dict(params["metadata"]))
             return None
@@ -2740,7 +2754,11 @@ class Hub:
             )
             return None
         if op == "fire_task_event":
-            await self.fire_task_event(params["task_id"], params["kind"], params.get("payload", {}))
+            payload = {
+                key: value[:_MAX_WIRE_TEXT] if isinstance(value, str) else value
+                for key, value in params.get("payload", {}).items()
+            }
+            await self.fire_task_event(params["task_id"], params["kind"], payload)
             return None
         if op == "checkpoint_task":
             await self.checkpoint_task(params["task_id"], params["state"])
@@ -2774,9 +2792,14 @@ class Hub:
         for task_id in _wire_task_ids(params):
             if not isinstance(task_id, str) or not _TASK_ID_RE.fullmatch(task_id):
                 raise ProtocolError(f"invalid task_id: {task_id!r}")
-        if op in _UNSCOPED_OPS:
+        if op in _UNSCOPED_OPS or op == "list_tasks":
             return
-        if op == "register":
+        if op == "get_task":
+            task = self._tasks.get(params["task_id"])
+            if task is not None and not self._task_visible(endpoint, task):
+                # Same answer as an unknown id, so ids cannot be probed.
+                raise NotFoundError(f"task not found: {params['task_id']}")
+        elif op == "register":
             if params["passport"].get("kind") == "remote_agent":
                 if not self._allow_remote_agent_registration:
                     raise AccessDeniedError("this hub does not accept remote_agent registration over the wire")
@@ -2788,6 +2811,11 @@ class Hub:
             self._require_bound(endpoint, params[_AGENT_SCOPED_OPS[op]])
             if op == "record_observation" and params.get("task_id") is not None:
                 self._require_task_owner(endpoint, params["task_id"])
+            if op == "report_turn_failure":
+                # A failure is reported for a turn in a channel the agent is in.
+                channel = self._channels.get(params["channel_id"])
+                if channel is None or params["agent_id"] not in channel.participant_ids():
+                    raise AccessDeniedError(f"agent is not a participant of channel {params['channel_id']!r}")
         elif op in _CHANNEL_SCOPED_OPS:
             self._require_participant(endpoint, params["channel_id"])
         elif op in _TASK_SCOPED_OPS:
@@ -2795,6 +2823,8 @@ class Hub:
                 raise AccessDeniedError("connection has no bound agent")
             if op == "fire_task_event":
                 self._authorize_mirror_failure(endpoint, params["task_id"], params["kind"], params.get("payload", {}))
+                if params["task_id"] not in self._tasks:
+                    await self._require_checkpoint_writer(endpoint, params["task_id"], claim=False)
             elif params["task_id"] in self._tasks:
                 self._require_task_owner(endpoint, params["task_id"])
             elif op in ("checkpoint_task", "read_task_checkpoint"):
@@ -2807,6 +2837,16 @@ class Hub:
                 EV_CHANNEL_INVITE_REJECT,
             ):
                 raise ProtocolError(f"{event_type!r} is emitted only by the hub")
+            # A wire client addresses only participants of the channel; it
+            # cannot push content to an agent that is not in it.
+            audience = params["envelope"].get("audience")
+            channel = self._channels.get(params["envelope"]["channel_id"])
+            if (
+                audience is not None
+                and channel is not None
+                and (not isinstance(audience, list) or not set(audience) <= set(channel.participant_ids()))
+            ):
+                raise ProtocolError("audience must list only participants of the channel")
         elif op == "observe_task":
             self._require_bound(endpoint, params["metadata"]["owner_id"])
             if params["metadata"].get("channel_id"):
@@ -2889,13 +2929,22 @@ class Hub:
         bound = self._endpoint_to_agents.get(endpoint.endpoint_id, set())
         if not bound:
             raise AccessDeniedError("connection has no bound agent")
-        raw = await self._store.read(task_checkpoint_writers_path(task_id))
-        if raw is None:
-            if claim:
-                await self._store.write(task_checkpoint_writers_path(task_id), json.dumps(sorted(bound)))
-            return
+        async with self._checkpoint_claim_lock:
+            raw = await self._store.read(task_checkpoint_writers_path(task_id))
+            if raw is None:
+                if claim:
+                    await self._store.write(task_checkpoint_writers_path(task_id), json.dumps(sorted(bound)))
+                return
         if not bound & set(json.loads(raw)):
             raise AccessDeniedError(f"connection holds no writer of task {task_id!r}'s checkpoint")
+
+    def _task_visible(self, endpoint: LinkEndpoint, task: TaskMetadata) -> bool:
+        """True if ``endpoint`` holds the task's owner or a participant of its channel."""
+        bound = self._endpoint_to_agents.get(endpoint.endpoint_id, set())
+        if task.owner_id in bound:
+            return True
+        channel = self._channels.get(task.channel_id) if task.channel_id else None
+        return channel is not None and bool(bound & set(channel.participant_ids()))
 
     def _require_task_owner(self, endpoint: LinkEndpoint, task_id: str) -> None:
         """Raise unless the owner of observed task ``task_id`` is bound to ``endpoint``.

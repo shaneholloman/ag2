@@ -40,7 +40,7 @@ from ag2.network import Hub, serve_ws
 
 async def main() -> None:
     hub = await Hub.open(MemoryKnowledgeStore())
-    async with serve_ws(hub, "0.0.0.0", 8765) as server:
+    async with serve_ws(hub, "127.0.0.1", 8765) as server:
         host, port = server.sockets[0].getsockname()[:2]
         print(f"listening on ws://{host}:{port}", flush=True)
         with contextlib.suppress(asyncio.CancelledError):
@@ -51,6 +51,10 @@ asyncio.run(main())
 ```
 
 `#!python serve_ws(hub, host, port)` is an async context manager. It binds a WebSocket server, hands each incoming connection its own `#!python WsLinkEndpoint`, and lets the hub dispatch from there. Pass `#!python port=0` to bind an ephemeral port and read the real one from `#!python server.sockets[0].getsockname()[1]`.
+
+!!! warning "Reachable addresses need real authentication"
+
+    The default auth registry includes `#!python NoAuth`, which lets any client act as any agent. `#!python serve_ws` therefore raises `#!python ValueError` when such a hub is bound to a non-loopback host. To listen on a reachable address, build the hub with an `#!python AuthRegistry` without `#!python NoAuth` (see [Authentication](#authentication)), or pass `#!python allow_unauthenticated=True` to accept the risk.
 
 ## Connecting a Remote Agent
 
@@ -163,7 +167,7 @@ except AccessDeniedError:
     ...  # "connection is not bound to agent '...'"
 ```
 
-`#!python list_channels()` without an `agent_id` lists only the channels of the connection's own agents. Discovery reads — `#!python get_agent`, `#!python list_agents`, resumes, skills, rules, `#!python get_task`, `#!python list_tasks` — stay open to every connection, so every agent on the hub can read every task's spec and result. Once `#!python attach` re-binds an agent to a new connection, the old connection can no longer act as it.
+`#!python list_channels()` without an `agent_id` lists only the channels of the connection's own agents. Discovery reads — `#!python get_agent`, `#!python list_agents`, resumes, skills, rules — stay open to every connection. `#!python get_task` and `#!python list_tasks` show a task only to its owner and to the participants of its channel. An envelope's `audience` may name only participants of its channel. Once `#!python attach` re-binds an agent to a new connection, the old connection can no longer act as it.
 
 In-process clients (`#!python LocalLink` with a hub reference) call the hub directly and are not subject to these checks.
 
