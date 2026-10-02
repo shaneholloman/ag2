@@ -48,14 +48,18 @@ from ag2.network import (
     PongFrame,
     ProtocolError,
     ReceiptFrame,
+    RequestFrame,
+    ResponseFrame,
     Resume,
     Rule,
+    WelcomeFrame,
     WsLink,
     WsLinkClient,
     serve_ws,
 )
 from ag2.network.hub.layout import passport_path
 from ag2.network.task_mirror import TaskMirror
+from ag2.network.testing import RacingKnowledgeStore
 from ag2.stream import MemoryStream
 from ag2.task import TaskMetadata, TaskSpec, TaskStarted, TaskState
 
@@ -138,7 +142,10 @@ class _TaskEvents(BaseHubListener):
 
 @asynccontextmanager
 async def _serve(
-    *, allow_no_auth: bool = False, allow_remote_agents: bool = False, store: MemoryKnowledgeStore | None = None
+    *,
+    allow_no_auth: bool = False,
+    allow_remote_agents: bool = False,
+    store: MemoryKnowledgeStore | None = None,
 ) -> AsyncGenerator[tuple[Hub, str]]:
     api_key = ApiKeyAuth(keys={name: f"k-{name}" for name in _NAMES})
     hub = await Hub.open(
@@ -225,25 +232,30 @@ class TestActingAsAnotherAgent:
 
     async def test_receipt_for_another_agent_does_not_advance_its_cursor(self) -> None:
         async with _serve() as (hub, url):
-            mallory_hc = HubClient(WsLink(url))
+            link = WsLinkClient(url)
             try:
-                await mallory_hc.register(_agent("mallory"), _passport("mallory"), Resume())
+                await hub.register_identity(_passport("mallory"), Resume())
                 # bob holds no connection, so nothing acks on his behalf.
                 bob = await hub.register_identity(_passport("bob"), Resume())
                 assert bob.agent_id is not None
-                link = mallory_hc._client_link
-                assert link is not None
+                await link.open()
+                frames = aiter(link.frames())
+                await link.send_frame(
+                    HelloFrame(name="mallory", auth_scheme="api_key", auth_claim={"token": "k-mallory"})
+                )
+                assert isinstance(await asyncio.wait_for(anext(frames), 2.0), WelcomeFrame)
 
                 await link.send_frame(
                     ReceiptFrame(envelope_id="z" * 32, status="ack", recipient_id=bob.agent_id, channel_id="c-1")
                 )
                 # Frames on one connection are handled in order: once this
                 # RPC answers, the receipt above has been processed.
-                await mallory_hc.get_agent("mallory")
+                await link.send_frame(RequestFrame(request_id="r-1", op="get_agent", params={"name_or_id": "mallory"}))
+                assert isinstance(await asyncio.wait_for(anext(frames), 2.0), ResponseFrame)
 
                 assert hub.inbox_cursor(bob.agent_id, "c-1") == ""
             finally:
-                await mallory_hc.close()
+                await link.close()
 
     async def test_checkpoint_of_an_unobserved_task_belongs_to_its_first_writer(self) -> None:
         async with _serve() as (_, url):
@@ -830,7 +842,7 @@ class TestTaskEvents:
                 await mallory_hc.close()
 
     async def test_concurrent_first_checkpoints_leave_one_writer(self) -> None:
-        async with _serve() as (_, url):
+        async with _serve(store=RacingKnowledgeStore("/checkpoint_writers.json")) as (_, url):
             bob_hc, mallory_hc = HubClient(WsLink(url)), HubClient(WsLink(url))
             try:
                 await bob_hc.register(_agent("bob"), _passport("bob"), Resume())
